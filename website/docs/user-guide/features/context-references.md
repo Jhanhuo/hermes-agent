@@ -99,7 +99,18 @@ Binary files are detected via MIME type and null-byte scanning. Known text exten
 
 Context references are primarily a **CLI feature**. They work in the interactive CLI where `@` triggers tab completion and references are expanded before the message is sent to the agent.
 
-In **messaging platforms** (Telegram, Discord, etc.), the `@` syntax is not expanded by the gateway — messages are passed through as-is. The agent itself can still reference files via the `read_file`, `search_files`, and `web_extract` tools.
+In **messaging platforms** (Telegram, Discord, QQ, etc.), the gateway expands references in inbound text by default, including queued follow-ups. This preprocessing runs before the model and is independent of its enabled tools: references can read files, invoke Git, fetch URLs, or call registered context-reference providers.
+
+To leave inbound references literal, set this in the **runtime profile's** `config.yaml`:
+
+```yaml
+context_references:
+  enabled: false
+```
+
+`enabled` must be a YAML boolean (`true` or `false`, not a quoted string). If the section or key is absent, expansion remains enabled for compatibility. `false` returns the literal reference text before model context-length discovery, parsing, or any built-in/custom reference provider runs. Invalid section/value types, an unreadable configuration, or a failed profile-policy check skip expansion and retain literal text with a warning; they never fall back to expanding.
+
+This setting applies only to **gateway inbound reference expansion**, on every messaging platform and in both direct and group chats. For cross-profile routing, the destination runtime profile controls it, not the receiving transport bot's profile. It does not change CLI/Desktop reference handling, ordinary attachment/STT processing, or the model's permission to use tools. Disable or constrain those tools separately if needed; this is not a sandbox for model execution.
 
 ## Interaction with Context Compression
 

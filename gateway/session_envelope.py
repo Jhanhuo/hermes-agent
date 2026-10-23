@@ -27,8 +27,10 @@ _EVENT_FIELDS = (
 # ``reply_anchor_override`` = '' is Telegram topic transfer's "do not quote the root DM" (#139136).
 _CONTEXT_FIELDS = ('auto_skill', 'channel_prompt', 'channel_context', 'reply_expected', 'reply_anchor_override',
                    'edit_revision')
-# Closed metadata contract: only the keys the Baileys adapter stamps on ordinary inbound
-# (``WhatsAppAdapter._build_message_event``) cross native admission; any other key refuses.
+# Closed metadata contract: platform-specific ordinary inbound context only;
+# unknown keys (especially trust-bearing fields) refuse rather than being dropped.
+_QQ_METADATA = frozenset({'qq_event_type', 'is_mention'})
+_QQ_GROUP_EVENTS = frozenset({'GROUP_MESSAGE_CREATE', 'GROUP_AT_MESSAGE_CREATE'})
 _WHATSAPP_METADATA = frozenset({'whatsapp_native_type', 'whatsapp_native', 'whatsapp_from_owner'})
 # Top-level ``nativeMetadata`` keys the bridge emits (scripts/whatsapp-bridge/bridge_helpers.js).
 _WHATSAPP_NATIVE_KEYS = frozenset({'video', 'audio', 'sticker', 'location', 'contact', 'contacts',
@@ -37,9 +39,27 @@ _WHATSAPP_NATIVE_MAX_BYTES = 16 * 1024
 _MEDIA_FIELDS = ('media_urls', 'media_types', 'media_text_inlined', 'media_filenames')
 
 
+def _qq_native_metadata(event):
+    """QQ group context is descriptive, never evidence of transport or authorization."""
+    metadata = event.metadata
+    if not isinstance(metadata, dict):
+        return None
+    if not metadata:
+        return {}
+    if set(metadata) != _QQ_METADATA:
+        return None
+    kind, mention = metadata['qq_event_type'], metadata['is_mention']
+    if (event.source.chat_type != 'group' or type(kind) is not str
+            or kind not in _QQ_GROUP_EVENTS or type(mention) is not bool):
+        return None
+    return {'qq_event_type': kind, 'is_mention': mention}
+
+
 def _native_metadata(event):
     """JSON projection of the adapter metadata a native replay keeps; ``None`` refuses the event.
     An oversized ``whatsapp_native`` (vCards with photos) is dropped, never refused."""
+    if event.source.platform.value == 'qqbot':
+        return _qq_native_metadata(event)
     metadata = event.metadata
     if not metadata:
         return {}

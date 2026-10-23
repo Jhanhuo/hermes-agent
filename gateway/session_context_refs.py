@@ -5,6 +5,7 @@ model-switch and skills notes) and managed workers (``--safe-mode`` / ``--ignore
 which never pass the inbound step) all expand here. A local session's refusal is the turn's reply:
 its adapter delivers through settlement, so a side ``send`` would never reach the viewer.
 """
+import asyncio
 import logging
 import os
 from contextlib import suppress
@@ -47,12 +48,27 @@ def _inbound_cwd(runner, source):
 async def inbound_references(runner, source, session_key, text):
     """``expand_references`` for an inbound turn: a local session's policy cwd, else the terminal cwd."""
     try:
-        cwd = _inbound_cwd(runner, source)
-        context_length = await runner._inbound_model_context_length(source, session_key)
+        # Intake may still be bound to the receiving bot; policy and expansion belong to
+        # the routed runtime. Keep the scope through expansion for plugin reference kinds.
+        async with runner._async_profile_scope_for_source(source):
+            from hermes_cli.config import load_config_readonly
+            from hermes_cli.config_read_errors import FailedConfigRead
+
+            config = await asyncio.to_thread(load_config_readonly)
+            if isinstance(config, FailedConfigRead):
+                raise ValueError("Cannot determine context_references policy from unreadable config")
+            refs_config = config.get("context_references", {})
+            if not isinstance(refs_config, dict) or type(refs_config.get("enabled", True)) is not bool:
+                raise ValueError("context_references.enabled must be a boolean in a mapping")
+            if not refs_config.get("enabled", True):
+                return text, None
+
+            cwd = _inbound_cwd(runner, source)
+            context_length = await runner._inbound_model_context_length(source, session_key)
+            return await expand_references(text, cwd=cwd, context_length=context_length)
     except Exception as exc:
         logger.warning("@ context reference expansion failed: %s", exc, exc_info=True)
         return text, None
-    return await expand_references(text, cwd=cwd, context_length=context_length)
 
 
 async def turn_references(runner, event, source, session_key, text):

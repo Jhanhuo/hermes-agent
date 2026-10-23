@@ -44,6 +44,7 @@ async def run_post_admission_hook(
                 POST_ADMISSION_HOOK, session_key=session_key,
                 platform=source.platform.value if source.platform else "",
                 source=source.to_dict(), message_id=event.message_id, text=event.text or "",
+                reply_expected=event.reply_expected,
             )
     except asyncio.CancelledError:
         raise
