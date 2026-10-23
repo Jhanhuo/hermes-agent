@@ -1793,6 +1793,8 @@ After registration, users can type `/mystatus` in any session. The command appea
 
 **Conflict protection:** If a plugin tries to register a name that conflicts with a built-in command (`help`, `model`, `new`, etc.), the registration is silently rejected with a log warning. Built-in commands always take precedence.
 
+**Shared-bot routing:** In a multiplex gateway, both command lookup and handler execution use the message's routed runtime profile. A secondary bot may receive the message under its transport profile for authorization, but the plugin manager, settings, and `plugin_data_dir()` follow the destination profile. The gateway also binds the source's session ContextVars around the handler and restores the transport scope afterward. A command installed only in the destination profile is therefore available without installing its stateful handler in the receiving bot's profile.
+
 **Calling-session context:** a handler can learn which chat and session invoked it by declaring any of these keyword parameters (or `**kwargs` for all of them). Handlers that declare none keep the one-argument `handler(raw_args)` call, so existing plugins are unaffected:
 
 | Keyword | Value |

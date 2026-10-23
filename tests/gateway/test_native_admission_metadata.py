@@ -118,12 +118,12 @@ async def test_native_codec_closed_metadata_contract_and_reply_expected(tmp_path
                     snapshot_native(runner, replace(event, **{name: bad}))
     finally:
         authority.db.close()
-    # Closed producer matrix: no other adapter stamps MessageEvent.metadata on ordinary inbound,
-    # so the WhatsApp keys above are the whole contract. A new producer must extend it here.
+    # Closed producer matrix: WhatsApp and QQ stamp ordinary inbound metadata.
+    # Their typed codec contracts are exercised here and in test_qqbot_native_admission.
     producers = set()
     for path in [*REPO.glob('gateway/platforms/**/*.py'), *REPO.glob('plugins/platforms/**/*.py')]:
         for node in ast.walk(ast.parse(path.read_text(encoding='utf-8'))):
             if (isinstance(node, ast.Call) and getattr(node.func, 'id', getattr(node.func, 'attr', '')) == 'MessageEvent'
                     and any(k.arg == 'metadata' for k in node.keywords)):
                 producers.add(path.relative_to(REPO).as_posix())
-    assert producers == {'plugins/platforms/whatsapp/adapter.py'}, producers
+    assert producers == {'plugins/platforms/whatsapp/adapter.py', 'plugins/platforms/qqbot/adapter.py'}, producers

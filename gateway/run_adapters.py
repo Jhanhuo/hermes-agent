@@ -1090,6 +1090,8 @@ class GatewayAdapterLifecycleMixin(GatewaySecondaryReconnectMixin):
                 "Enable GATEWAY_ALLOW_ALL_USERS or the platform allow-all flag "
                 "for that profile, or change dm_policy/group_policy away from 'open'."
             )
+        from gateway.owned_group_service import service_for
+        service_for(self).register_runtime(profile_name, profile_home)
         return profile_cfg
 
     @staticmethod
@@ -1349,10 +1351,13 @@ class GatewayAdapterLifecycleMixin(GatewaySecondaryReconnectMixin):
     ) -> None:
         """Install the runner callbacks every adapter needs (defaults = primary handlers;
         secondary wiring passes profile-scoped variants). ``set_reaction_handler`` is optional."""
-        adapter.set_message_handler(message_handler or self._primary_message_handler())
+        message_handler = message_handler or self._primary_message_handler()
+        adapter.set_message_handler(message_handler)
         adapter.set_fatal_error_handler(fatal_error_handler or self._handle_adapter_fatal_error)
         adapter.set_session_store(self.session_store)
-        adapter.set_busy_session_handler(busy_session_handler or self._primary_busy_session_handler())
+        from gateway.owned_group_service import wrap_busy_handler
+        adapter.set_busy_session_handler(wrap_busy_handler(
+            self, busy_session_handler or self._primary_busy_session_handler(), message_handler=message_handler))
         _set_reaction = getattr(adapter, "set_reaction_handler", None)
         if callable(_set_reaction):
             _set_reaction(self._handle_reaction_event)
@@ -1643,12 +1648,8 @@ class GatewayAdapterLifecycleMixin(GatewaySecondaryReconnectMixin):
         return bool(getattr(self.config, "multiplex_profiles", False))
 
     async def _handle_gateway_platform_event(self, event: dict, source) -> None:
-        """Authorize and publish one normalized adapter event to plugin hooks."""
-        # Observer failures must never break the adapter's update loop.
-        with _log_suppressed(logging.DEBUG, "gateway_platform_event hook dispatch failed", exc_info=True):
-            from hermes_cli.lifecycle import has_hook, invoke_hook
-            if has_hook("gateway_platform_event") and self._is_user_authorized_for_source(source):
-                invoke_hook("gateway_platform_event", **event)
+        from gateway.owned_group_observation import dispatch_platform_event
+        await dispatch_platform_event(self, event, source)
 
     def _make_profile_platform_event_handler(self, profile_name: str):
         """Bind platform-event auth and hook dispatch to one multiplex profile."""

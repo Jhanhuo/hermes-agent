@@ -1828,6 +1828,9 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         self._draining = True
         from gateway.run_runtime import drain_gateway_runtime
         await drain_gateway_runtime(self)
+        owned = getattr(self, "_owned_group_service", None)
+        if owned is not None:
+            await owned.shutdown(timeout=5.0)
         self._mark_api_runs_shutdown_requested()
         # getattr-guards: shutdown-path test doubles may lack the room worker / systemd watchdog.
         stop_room_worker = getattr(self, "_stop_hosted_room_worker", None)

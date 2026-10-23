@@ -1266,7 +1266,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         """Handle an incoming message from any platform: auth → command check → running-agent
         interrupt → get/create session → build context → run agent → return response."""
         from gateway.run import _AGENT_PENDING_SENTINEL
-        _admitted = await self._hm_admit_event(event)
+        from gateway.owned_group_service import admit_event
+        _admitted = await admit_event(self, event)
         if _admitted is None:
             return None
         event, source, is_internal = _admitted

@@ -193,6 +193,10 @@ VALID_HOOKS: set[str] = {
     # hooks.md). Other event types and hook names land here only together with real fire-sites and payload
     # contracts; no inert VALID_HOOKS surface is registered ahead of implementation.
     "gateway_platform_event",
+    # Exclusive async owner: operation=(turn|observe|tick|shutdown), ticket, host.
+    # Scoped capabilities and fail-closed dispatch live in gateway.owned_group_service;
+    # return values never become native replies. This is not a broadcast observer.
+    "gateway_owned_group",
     # pre_command: BEFORE a recognized slash command's handler on CLI and gateway canonical dispatch;
     # returns IGNORED in v1. Deliberately NOT fired for the gateway's running-agent intercept path
     # (/stop, /approve, busy_policy) — a slow/hostile plugin must not touch the operator's escape

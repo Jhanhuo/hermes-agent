@@ -252,9 +252,17 @@ class GatewayInboundHooksMixin:
         if command:
             try:
                 from hermes_cli.plugins import get_plugin_command_handler
-                plugin_handler = get_plugin_command_handler(command.replace("_", "-"))
-                if plugin_handler:
-                    return True, await self._hm_run_plugin_handler(plugin_handler, event, source), command
+                # Lookup and execution belong to the routed runtime, not the receiving bot.
+                async with self._async_profile_scope_for_source(source):
+                    normalized = command.replace("_", "-")
+                    plugin_handler = get_plugin_command_handler(normalized)
+                    if plugin_handler:
+                        # Runtime-only commands are unknown to the transport's early gate.
+                        # The source identity still selects the receiving bot's slash policy.
+                        denied = self._check_slash_access(source, normalized)
+                        if denied is not None:
+                            return True, denied, command
+                        return True, await self._hm_run_plugin_handler(plugin_handler, event, source), command
             except Exception as e:
                 logger.warning("Plugin command dispatch failed: %s", e, exc_info=True)
         return False, None, command

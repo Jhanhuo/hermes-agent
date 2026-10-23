@@ -4,6 +4,7 @@ Drives the real ``GatewayRunner._handle_message`` pipeline and the real plugin d
 are registered on the per-home ``PluginManager`` exactly as ``ctx.register_hook`` stores them.
 """
 
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -85,6 +86,55 @@ async def test_handled_consumes_the_turn_and_its_reply_is_delivered():
     assert first["platform"] == "whatsapp"
     assert first["source"]["chat_id"] == "15551234567@s.whatsapp.net" and first["session_key"]
     assert "gateway" not in first and "session_store" not in first
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reply_expected", [True, False, None])
+async def test_reply_expectation_is_an_admitted_snapshot_without_live_handles(reply_expected):
+    event = _event()
+    event.reply_expected = reply_expected
+    event.raw_message = {"private_transport_data": "must-not-cross-hook-boundary"}
+    seen = []
+
+    def consume(**kwargs):
+        seen.append(kwargs)
+        # Mutating the plain routing snapshot cannot change the live event.
+        kwargs["source"]["chat_id"] = "plugin-local-copy"
+        return {"action": "handled"}
+
+    _register(consume)
+    runner = _runner()
+    original_chat_id = event.source.chat_id
+
+    assert await runner._handle_message(event) is None
+    assert seen[0]["reply_expected"] is reply_expected
+    event.reply_expected = not reply_expected
+    assert seen[0]["reply_expected"] is reply_expected
+    assert event.source.chat_id == original_chat_id
+    snapshot = json.dumps(seen[0])  # A live event/runner/store handle is not JSON data.
+    assert "must-not-cross-hook-boundary" not in snapshot
+    assert not {"event", "gateway", "session_store", "raw_message"}.intersection(seen[0])
+    runner._handle_message_with_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gate", ["authorization", "bot_admission"])
+async def test_rejected_group_message_never_reaches_admission_consumer(gate):
+    seen = []
+    _register(lambda **kwargs: seen.append(kwargs) or {"action": "handled"})
+    runner = _runner()
+    event = _event()
+    event.source.chat_type = "group"
+    event.reply_expected = False
+    if gate == "authorization":
+        runner._is_user_authorized_for_source = lambda _source: False
+    else:
+        event.source.is_bot = True
+        runner._admit_bot_message_for_source = lambda _source: False
+
+    assert await runner._handle_message(event) is None
+    assert seen == []
+    runner._handle_message_with_agent.assert_not_awaited()
 
 
 @pytest.mark.asyncio

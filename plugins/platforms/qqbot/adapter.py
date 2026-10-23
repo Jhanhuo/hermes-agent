@@ -146,6 +146,12 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         super().__init__(config, Platform.QQBOT)
 
         extra = config.extra or {}
+        self.observe_group_messages = extra.get("observe_group_messages", False)
+        if type(self.observe_group_messages) is not bool:
+            raise ValueError("QQ observe_group_messages must be a boolean")
+        self.require_mention = extra.get("require_mention", False)
+        if type(self.require_mention) is not bool:
+            raise ValueError("QQ require_mention must be a boolean")
         self._app_id = str(extra.get("app_id") or _resolve_qq_secret("QQ_APP_ID", "")).strip()
         self._client_secret = str(extra.get("client_secret") or _resolve_qq_secret("QQ_CLIENT_SECRET", "")).strip()
         self._markdown_support = bool(extra.get("markdown_support", True))
@@ -161,6 +167,7 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._heartbeat_interval: float = 30.0  # seconds, updated by Hello
         self._session_id: Optional[str] = None
+        self._bot_user_id: Optional[str] = None  # READY user.id, not the application ID.
         self._last_seq: Optional[int] = None
         self._chat_type_map: dict[str, str] = {}  # chat_id → "c2c"|"group"|"guild"|"dm"
         self._pending_responses: dict[str, asyncio.Future] = {}  # request/response correlation
@@ -182,6 +189,17 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
     @property
     def name(self) -> str:
         return "QQBot"
+
+    async def send_group_reply_once(
+        self, *, group_id: str, message_id: str, content: str,
+        message_time: float, expected_app_id: str,
+    ):
+        """Return StrictSendResult; trusted callers still own session authorization."""
+        from plugins.platforms.qqbot import strict_send
+        return await strict_send.send_group_reply_once(
+            self, group_id=group_id, message_id=message_id, content=content,
+            message_time=message_time, expected_app_id=expected_app_id,
+        )
 
     # ── Connection lifecycle ──
 
@@ -521,6 +539,10 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             if t == "READY":
                 if isinstance(d, dict):  # store session_id for resume
                     self._session_id = d.get("session_id")
+                    user = d.get("user")
+                    user = user if isinstance(user, dict) else {}
+                    user_id = user.get("id")
+                    self._bot_user_id = user_id if isinstance(user_id, str) and user_id else None
                     logger.info("[%s] Ready, session_id=%s", self._log_tag, self._session_id)
             elif t == "RESUMED":
                 logger.info("[%s] Session resumed", self._log_tag)
@@ -567,13 +589,29 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
     # ── Inbound message handling ──
 
     async def handle_message(self, event: MessageEvent) -> None:
-        """Cache the last message ID per chat, then delegate to base."""
+        """Admit addressed groups before Base can queue/steer; cache only admitted IDs."""
+        # Guild channels also normalize to source.chat_type="group", but this
+        # option is for QQ groups; keep the pre-existing guild intake unchanged.
+        if (self.require_mention and event.source.chat_type == "group"
+                and self._guess_chat_type(event.source.chat_id) != "guild"
+                and event.reply_expected is not True):
+            event._gateway_accepted = False
+            return
         if event.message_id and event.source.chat_id:
             self._last_msg_id[event.source.chat_id] = event.message_id
         await super().handle_message(event)
 
     async def _on_message(self, event_type: str, d: Any) -> None:
         if not isinstance(d, dict):
+            return
+        if event_type in {"GROUP_MESSAGE_CREATE", "GROUP_AT_MESSAGE_CREATE"}:
+            from plugins.platforms.qqbot.observer import observe_group_message
+            await observe_group_message(self, event_type, d)
+        # A full event without proven addressing must not reserve the ID of a
+        # later AT copy that mention-only intake can actually execute. This check
+        # and dedup insertion are synchronous, before attachment/STT awaits.
+        if (self.require_mention and event_type == "GROUP_MESSAGE_CREATE"
+                and not self._group_message_is_mention(event_type, d)):
             return
         msg_id = str(d.get("id", ""))
         if not msg_id or self._dedup.is_duplicate(msg_id):
@@ -582,8 +620,9 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         handler = self._INBOUND_HANDLERS.get(event_type)
         if handler:
             author = d.get("author") if isinstance(d.get("author"), dict) else {}
+            event_kwargs = {"event_type": event_type} if handler == "_handle_group_message" else {}
             await getattr(self, handler)(
-                d, msg_id, str(d.get("content", "")).strip(), author, str(d.get("timestamp", "")))
+                d, msg_id, str(d.get("content", "")).strip(), author, str(d.get("timestamp", "")), **event_kwargs)
 
     # ── Inline-keyboard interactions (INTERACTION_CREATE) ──
 
@@ -759,14 +798,38 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             d, msg_id, content, attachments_raw, timestamp, verbose=True,
             chat_id=user_openid, qq_chat_type="c2c", user_id=user_openid, chat_type="dm")
 
-    async def _handle_group_message(self, d, msg_id, content, author, timestamp) -> None:
+    def _group_message_is_mention(self, event_type: str, d: dict[str, Any]) -> bool:
+        if event_type == "GROUP_AT_MESSAGE_CREATE":
+            return True
+        mentions = d.get("mentions")
+        return bool(self._bot_user_id) and any(
+            isinstance(mention, dict) and mention.get("id") == self._bot_user_id
+            for mention in (mentions if isinstance(mentions, list) else ()))
+
+    async def _handle_group_message(
+        self, d, msg_id, content, author, timestamp, *, event_type="GROUP_AT_MESSAGE_CREATE"
+    ) -> None:
         group_openid = str(d.get("group_openid", ""))
         member = str(author.get("member_openid", ""))
         if not group_openid or not self._is_group_allowed(group_openid, member):
             return
+        is_mention = self._group_message_is_mention(event_type, d)
+        # Normalize the same proven self prefix whichever copy wins dedup, so a
+        # full event cannot hide a slash command behind <@!self>. Never remove
+        # another member's token just because this bot also occurs in mentions.
+        self_prefix = (re.match(rf"^<@!?{re.escape(self._bot_user_id)}>\s*", content)
+                       if is_mention and self._bot_user_id else None)
+        if self_prefix:
+            content = content[self_prefix.end():]
+        elif event_type == "GROUP_AT_MESSAGE_CREATE":
+            content = self._strip_at_mention(content)
+        member_info = d.get("member") if isinstance(d.get("member"), dict) else {}
+        nick = member_info.get("nick") or author.get("username") or author.get("nickname")
         await self._ingest(
-            d, msg_id, self._strip_at_mention(content), d.get("attachments"), timestamp,
-            chat_id=group_openid, qq_chat_type="group", user_id=member, chat_type="group")
+            d, msg_id, content, d.get("attachments"), timestamp,
+            event_metadata={"qq_event_type": event_type, "is_mention": is_mention}, reply_expected=is_mention,
+            chat_id=group_openid, qq_chat_type="group", user_id=member, chat_type="group",
+            user_name=str(nick) if nick else None, is_bot=author.get("bot") is True)
 
     async def _handle_guild_message(self, d, msg_id, content, author, timestamp) -> None:
         channel_id = str(d.get("channel_id", ""))
@@ -803,6 +866,7 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
 
     _INBOUND_HANDLERS = {
         "C2C_MESSAGE_CREATE": "_handle_c2c_message",
+        "GROUP_MESSAGE_CREATE": "_handle_group_message",
         "GROUP_AT_MESSAGE_CREATE": "_handle_group_message",
         "GUILD_MESSAGE_CREATE": "_handle_guild_message",
         "GUILD_AT_MESSAGE_CREATE": "_handle_guild_message",
@@ -817,7 +881,9 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
 
     async def _ingest(
         self, d: dict[str, Any], msg_id: str, content: str, attachments: Any, timestamp: str, *,
-        chat_id: str, qq_chat_type: str, verbose: bool = False, **source_kwargs: Any) -> None:
+        chat_id: str, qq_chat_type: str, verbose: bool = False,
+        event_metadata: Optional[dict[str, Any]] = None, reply_expected: Optional[bool] = None,
+        **source_kwargs: Any) -> None:
         """Shared inbound tail: fold attachment transcripts/file info and quoted context
         into the text, drop empty events, remember the QQ chat kind and dispatch."""
         att = await self._process_attachments(attachments)
@@ -845,6 +911,7 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             message_type=self._detect_message_type(image_urls, image_media_types), raw_message=d,
             message_id=msg_id, media_urls=image_urls, media_types=image_media_types,
             timestamp=self._parse_qq_timestamp(timestamp),
+            metadata=event_metadata or {}, reply_expected=reply_expected,
         )
         await self.handle_message(event)
 
