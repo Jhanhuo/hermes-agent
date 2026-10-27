@@ -201,6 +201,18 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             message_time=message_time, expected_app_id=expected_app_id,
         )
 
+    async def send_group_image_reply_once(
+        self, *, group_id: str, message_id: str, image_data: bytes, mime_type: str,
+        message_time: float, expected_app_id: str, recheck,
+    ):
+        """Strict single image; trusted callers own authorization and shared quota."""
+        from plugins.platforms.qqbot import strict_media
+        return await strict_media.send_group_image_reply_once(
+            self, group_id=group_id, message_id=message_id, image_data=image_data,
+            mime_type=mime_type, message_time=message_time, expected_app_id=expected_app_id,
+            recheck=recheck,
+        )
+
     # ── Connection lifecycle ──
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
