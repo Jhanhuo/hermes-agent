@@ -82,6 +82,37 @@ class OwnedGroupTicket:
                 group_id=self.group_id, message_id=self.message_id, content=text,
                 message_time=self.message_time, expected_app_id=self.bot_id)
 
+    async def submit_image(self, image_data: bytes, mime_type: str, *, recheck) -> StrictSendResult:
+        """Trusted image submission; never accepts an alternate target or anchor.
+
+        The caller owns the shared outbound ledger. The callback is ephemeral,
+        uses routed-runtime scope while transport authorization is checked in
+        the receiving profile before/after it. It is never serialized.
+        """
+        binding = self._binding
+        if binding is None:
+            return StrictSendResult("rejected", reason="owned_authorization_revoked")
+        adapter = binding.adapter
+        with _scope(binding.authorization_home):
+            if not self.authorized():
+                return StrictSendResult("rejected", reason="owned_authorization_revoked")
+
+            async def authorized_recheck():
+                if (self._binding is not binding or binding.adapter is not adapter
+                        or not self.authorized()):
+                    return False
+                with _scope(self.runtime_home):
+                    allowed = await recheck()
+                if allowed is not True:
+                    return False
+                return (self._binding is binding and binding.adapter is adapter
+                        and self.authorized())
+
+            return await adapter.send_group_image_reply_once(
+                group_id=self.group_id, message_id=self.message_id, image_data=image_data,
+                mime_type=mime_type, message_time=self.message_time, expected_app_id=self.bot_id,
+                recheck=authorized_recheck)
+
 
 @dataclass(frozen=True)
 class NativeGroupContext:
