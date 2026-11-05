@@ -6,6 +6,7 @@ allowlist, the receiving Bot identity and an already usable transport/token.
 An unknown result is not permission to retry; even cancellation after submission
 cannot retract the request. API acceptance does not prove human delivery.
 """
+import logging
 import math
 import re
 import time
@@ -22,6 +23,78 @@ class StrictSendResult:
     status: Literal["accepted", "rejected", "unknown"]
     message_id: str = ""
     reason: str = ""
+
+
+_NO_RESPONSE_BODY = object()
+
+
+def _upload_response_shape(result, body):
+    """Fixed-key type/size metadata and bounded numeric error codes, not payloads."""
+    def shape(value):
+        if value is _NO_RESPONSE_BODY:
+            return "missing"
+        if type(value) is str:
+            return f"string:{min(len(value), 16385)}"
+        return {type(None): "null", bool: "boolean", int: "integer", float: "number",
+                dict: "object", list: "array"}.get(type(value), "other")
+
+    def field(container, name):
+        return container.get(name, _NO_RESPONSE_BODY) if type(container) is dict else _NO_RESPONSE_BODY
+
+    reason = result.reason
+    reason = reason if type(reason) is str and reason in {
+        "invalid_upload_response", "unexpected_upload_message", "upload_application_error", "invalid_file_info",
+    } else "other"
+    data = field(body, "data")
+    info = field(body, "file_info")
+    bounded_info = type(info) is str and len(info) <= 16384
+    details = {
+        "validation": reason, "body_kind": shape(body).split(":", 1)[0],
+        "id_shape": shape(field(body, "id")), "message_id_shape": shape(field(body, "message_id")),
+        "data_kind": shape(data).split(":", 1)[0],
+        "data_id_shape": shape(field(data, "id")), "data_message_id_shape": shape(field(data, "message_id")),
+        "file_info_shape": shape(info),
+        "file_info_blank": str(not info.strip()).lower() if bounded_info else "none",
+        "file_info_controls": str(any(unicodedata.category(c) in {"Cc", "Cs"} for c in info)).lower()
+        if bounded_info else "none",
+    }
+    for name in ("code", "error", "err_code"):
+        value = field(body, name)
+        details[name + "_shape"] = shape(value)
+        details[name + "_value"] = value if type(value) is int and -(2 ** 31) <= value < 2 ** 31 else "none"
+    return details
+
+
+def _diagnose_result(result, *, kind, stage, http_status=None, error=None, response_body=_NO_RESPONSE_BODY):
+    """Best-effort allowlisted metadata, never payloads, IDs or exception text."""
+    try:
+        kind = kind if type(kind) is str and kind in {"image", "audio", "text"} else "unknown"
+        stage = stage if type(stage) is str and stage in {
+            "gate", "recheck", "upload_request", "upload_response", "submit_request", "submit_response",
+        } else "unknown"
+        status = result.status if type(result.status) is str and result.status in {
+            "accepted", "rejected", "unknown",
+        } else "unknown"
+        code = http_status if type(http_status) is int and 100 <= http_status <= 599 else "none"
+        exception_type = "none"
+        if error is not None:
+            name = type(error).__name__[:64]
+            exception_type = name if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", name) else "Exception"
+        template = "qq_strict_send kind=%s stage=%s status=%s http_status=%s exception_type=%s"
+        values = (kind, stage, status, code, exception_type)
+        if stage == "upload_response" and status != "accepted" and response_body is not _NO_RESPONSE_BODY:
+            details = _upload_response_shape(result, response_body)
+            template += "".join(" " + name + "=%s" for name in details)
+            values += tuple(details.values())
+        logging.getLogger("gateway.platforms.qqbot").log(
+            logging.INFO if status == "accepted" else logging.WARNING,
+            template, *values,
+        )
+    except Exception:
+        # A failing handler must not change an already decided outcome or retry.
+        # Cancellation and BaseException tripwires still propagate.
+        pass
+    return result
 
 
 def _valid_time(value) -> bool:
@@ -66,23 +139,27 @@ def _classify_response(response) -> StrictSendResult:
 
 async def send_group_reply_once(adapter, *, group_id, message_id, content,
                                 message_time, expected_app_id) -> StrictSendResult:
+    def finish(result, *, stage="gate", http_status=None, error=None):
+        return _diagnose_result(result, kind="text", stage=stage,
+                                http_status=http_status, error=error)
+
     if adapter.config.extra.get("strict_group_replies") is not True:
-        return StrictSendResult("rejected", reason="disabled")
+        return finish(StrictSendResult("rejected", reason="disabled"))
     if not isinstance(expected_app_id, str) or not expected_app_id or expected_app_id != adapter._app_id:
-        return StrictSendResult("rejected", reason="app_mismatch")
+        return finish(StrictSendResult("rejected", reason="app_mismatch"))
     if not adapter.is_connected or adapter._http_client is None:
-        return StrictSendResult("rejected", reason="offline")
+        return finish(StrictSendResult("rejected", reason="offline"))
     if error := _input_error(group_id, message_id, content):
-        return StrictSendResult("rejected", reason=error)
+        return finish(StrictSendResult("rejected", reason=error))
     if adapter._group_policy != "allowlist" or group_id not in adapter._group_allow_from:
-        return StrictSendResult("rejected", reason="group_not_allowed")
+        return finish(StrictSendResult("rejected", reason="group_not_allowed"))
     now = time.time()
     if not _valid_time(now) or not _valid_time(message_time) or not 0 <= now - message_time < 285:
-        return StrictSendResult("rejected", reason="invalid_message_time")
+        return finish(StrictSendResult("rejected", reason="invalid_message_time"))
     if (not isinstance(adapter._access_token, str) or not adapter._access_token
             or not _valid_time(adapter._token_expires_at)
             or adapter._token_expires_at - now <= 60):
-        return StrictSendResult("rejected", reason="token_unavailable")
+        return finish(StrictSendResult("rejected", reason="token_unavailable"))
     try:
         response = await adapter._http_client.request(
             "POST", API_BASE + "/v2/groups/" + group_id + "/messages",
@@ -91,7 +168,8 @@ async def send_group_reply_once(adapter, *, group_id, message_id, content,
                      "Content-Type": "application/json", "User-Agent": build_user_agent()},
             timeout=10.0, follow_redirects=False,
         )
-    except Exception:
+    except Exception as error:
         # Never echo transport/token details, retry, or swallow CancelledError.
-        return StrictSendResult("unknown", reason="transport_error")
-    return _classify_response(response)
+        return finish(StrictSendResult("unknown", reason="transport_error"),
+                      stage="submit_request", error=error)
+    return finish(_classify_response(response), stage="submit_response", http_status=response.status_code)

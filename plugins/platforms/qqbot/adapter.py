@@ -213,6 +213,18 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             recheck=recheck,
         )
 
+    async def send_group_audio_reply_once(
+        self, *, group_id: str, message_id: str, audio_data: bytes, mime_type: str,
+        message_time: float, expected_app_id: str, recheck,
+    ):
+        """Strict MP3 reply; caller owns authorization, quota and original anchor."""
+        from plugins.platforms.qqbot import strict_media
+        return await strict_media.send_group_audio_reply_once(
+            self, group_id=group_id, message_id=message_id, audio_data=audio_data,
+            mime_type=mime_type, message_time=message_time, expected_app_id=expected_app_id,
+            recheck=recheck,
+        )
+
     # ── Connection lifecycle ──
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:

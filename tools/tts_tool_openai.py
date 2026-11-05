@@ -39,14 +39,15 @@ def _managed_openai_audio_route() -> Optional[tuple]:
     return gateway.nous_user_token, urljoin(f"{gateway.gateway_origin.rstrip('/')}/", "v1"), True
 
 
-def _resolve_openai_audio_client_config() -> tuple[str, str, bool]:
+def _resolve_openai_audio_client_config(tts_config: Optional[dict[str, Any]] = None) -> tuple[str, str, bool]:
     """``(api_key, base_url, is_managed)`` for the OpenAI audio client (``is_managed`` = the restricted
     Nous proxy, so callers coerce the request). Strict on the stored ``tts`` selection: ``"nous"``
     → managed ONLY (error if unavailable); any other → direct credentials ONLY (``tts.openai.api_key``
     then ``VOICE_TOOLS_OPENAI_KEY``/``OPENAI_API_KEY``); unset → config key → env key → managed."""
     origin = _origin()
-    openai_cfg = _section(origin._load_tts_config(), "openai")
-    selected = read_selection("tts")
+    openai_cfg = _section(origin._load_tts_config() if tts_config is None else tts_config, "openai")
+    # A supplied snapshot pins selection across preflight and synthesis. No second config read.
+    selected = read_selection("tts") if tts_config is None else tts_config.get("provider", "edge")
     if selected == NOUS_MANAGED_PROVIDER:
         route = _managed_openai_audio_route()
         if route is None:
@@ -95,18 +96,27 @@ def _openai_extra_body(oai_config: dict[str, Any]) -> dict[str, Any]:
 def _generate_openai_tts(
     text: str, output_path: str, tts_config: dict[str, Any], *, api_key: Optional[str] = None,
     base_url: Optional[str] = None, model: Optional[str] = None, voice: Optional[str] = None,
-    speed: Optional[float] = None, instructions: Optional[str] = None) -> str:
+    speed: Optional[float] = None, instructions: Optional[str] = None,
+    controlled: bool = False) -> str:
     """Generate audio via the OpenAI ``audio.speech.create`` SDK shape.
 
     Explicit kwargs let OpenAI-compatible backends (DeepInfra) supply credentials/model/voice
     and skip the managed-gateway resolution; otherwise the OpenAI auth chain and ``tts.openai``
     (speed falling back to ``tts.speed``) apply. ``instructions`` is forwarded only when truthy
     so ``tts-1`` and strict OpenAI-compatible servers that reject unknown kwargs are unaffected."""
+    if controlled:
+        from openai import DefaultHttpxClient, OpenAI  # Passive import before auth resolution/network activity.
+        if tts_config.get("provider") == NOUS_MANAGED_PROVIDER:
+            cfg = _section(tts_config, "openai")
+            if cfg.get("base_url") or cfg.get("model", DEFAULT_OPENAI_MODEL) not in MANAGED_OPENAI_TTS_MODELS:
+                raise ValueError("Managed TTS route/model override is not supported in controlled mode")
     fallback_base: Optional[str] = None
     is_managed = False
     explicit_base_url = base_url is not None
     if api_key is None:
-        api_key, fallback_base, is_managed = _resolve_openai_audio_client_config()
+        api_key, fallback_base, is_managed = (
+            _resolve_openai_audio_client_config(tts_config) if controlled
+            else _resolve_openai_audio_client_config())
     oai_config = _section(tts_config, "openai")
     if model is None:
         model = oai_config.get("model", DEFAULT_OPENAI_MODEL)
@@ -137,7 +147,13 @@ def _generate_openai_tts(
         create_kwargs["instructions"] = instructions
     if extra_body := _openai_extra_body(oai_config):
         create_kwargs["extra_body"] = extra_body
-    client = _origin()._import_openai_client()(api_key=api_key, base_url=base_url)
+    if controlled:
+        # SDK retries and HTTP redirects are separate: 307/308 can replay the POST.
+        # The SDK rejects 3xx before materializing audio; client.close owns this transport.
+        client = OpenAI(api_key=api_key, base_url=base_url, max_retries=0, timeout=60,
+                        http_client=DefaultHttpxClient(follow_redirects=False, timeout=60))
+    else:
+        client = _origin()._import_openai_client()(api_key=api_key, base_url=base_url)
     try:
         client.audio.speech.create(**create_kwargs).stream_to_file(output_path)
         return output_path
@@ -147,7 +163,9 @@ def _generate_openai_tts(
             close()
 
 
-def _generate_deepinfra_tts(text: str, output_path: str, tts_config: dict[str, Any]) -> str:
+def _generate_deepinfra_tts(
+    text: str, output_path: str, tts_config: dict[str, Any], *, controlled: bool = False,
+) -> str:
     """Resolve DeepInfra credentials/model (live ``hermes_cli.models`` catalog, no hardcoded ids), then
     delegate to the OpenAI-compatible handler."""
     api_key = _origin()._resolve_provider_key("DEEPINFRA_API_KEY", "deepinfra")
@@ -157,6 +175,8 @@ def _generate_deepinfra_tts(text: str, output_path: str, tts_config: dict[str, A
     from hermes_cli.models import deepinfra_base_url, deepinfra_model_ids
     model = di_config.get("model")
     if not isinstance(model, str) or not model.strip():
+        if controlled:
+            raise ValueError("Controlled DeepInfra TTS requires a configured model")
         candidates = deepinfra_model_ids("tts")
         if not candidates:
             raise ValueError(
@@ -167,4 +187,5 @@ def _generate_deepinfra_tts(text: str, output_path: str, tts_config: dict[str, A
     return _origin()._generate_openai_tts(
         text, output_path, tts_config, api_key=api_key, base_url=deepinfra_base_url(di_config),
         model=model, voice=di_config.get("voice", DEFAULT_DEEPINFRA_TTS_VOICE),
-        speed=float(di_config.get("speed", tts_config.get("speed", 1.0))))
+        speed=float(di_config.get("speed", tts_config.get("speed", 1.0))),
+        **({"controlled": True} if controlled else {}))

@@ -814,7 +814,10 @@ def _confine_source_images(image_url, reference_image_urls, task_id, *, permitte
     return image_url, reference_image_urls, None
 
 
-def _handle_image_generate(args, **kw):
+def _handle_image_generate(args, *, controlled: bool = False, **kw):
+    if controlled:
+        from tools.image_generation_managed import generate_controlled_reply
+        return generate_controlled_reply(args)
     prompt = args.get("prompt", "")
     if not prompt:
         return tool_error("prompt is required for image generation")

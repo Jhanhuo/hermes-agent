@@ -100,3 +100,82 @@ def managed_image_catalog(
                 continue
             catalog[mid] = {**row, "backend": PORTAL}
     return catalog, DEFAULT_MODEL
+
+
+class ControlledImageError(ValueError):
+    """A bounded, credential-free failure safe for the internal reply caller."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
+def _controlled_selection(config: dict) -> tuple[str, str]:
+    section = config.get("image_gen")
+    if not isinstance(section, dict):
+        raise ControlledImageError("selection_required", "Configure an image provider and model first.")
+    provider, model = section.get("provider"), section.get("model")
+    if section.get("use_gateway") and provider != NOUS_MANAGED_PROVIDER:
+        raise ControlledImageError("selection_conflict", "image_gen.provider conflicts with use_gateway.")
+    if not all(isinstance(v, str) and v and v == v.strip() for v in (provider, model)):
+        raise ControlledImageError("selection_required", "An exact image provider and model are required.")
+    if provider != "openai-codex":
+        raise ControlledImageError(
+            "unsupported_controlled_provider", "This provider has no audited no-install, single-submit path.")
+    from plugins.image_gen._common import GPT_IMAGE_2_TIERS
+    if model not in GPT_IMAGE_2_TIERS:
+        raise ControlledImageError("invalid_model", "The configured model is not in the Codex catalog.")
+    nested = section.get(provider, {})
+    if not isinstance(nested, dict) or nested.get("model", model) != model:
+        raise ControlledImageError("selection_conflict", "Conflicting image model selections.")
+    return provider, model
+
+
+def _validate_controlled_args(args: dict) -> None:
+    if (not isinstance(args, dict) or set(args) - {"prompt", "aspect_ratio", "upscale"}
+            or args.get("upscale", False) is not False or args.get("aspect_ratio", "square") != "square"):
+        raise ControlledImageError("invalid_arguments", "Only one square text-to-image reply is supported.")
+    prompt = args.get("prompt")
+    if (not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 2000
+            or any(ord(char) < 32 and char not in "\n\t" for char in prompt)):
+        raise ControlledImageError("invalid_arguments", "A bounded image description is required.")
+    try:
+        prompt.encode("utf-8")
+    except UnicodeError:
+        raise ControlledImageError("invalid_arguments", "Invalid image description encoding.") from None
+
+
+def generate_controlled_reply(args: dict) -> str:
+    """Internal text-to-image result only; never run normal tool dispatch or terminal sync.
+
+    The caller owns the runtime/secret scope, worker lifetime, image validation and delivery.
+    This result MUST NOT be appended to model tool history (which auto-collects media).
+    """
+    import json
+    import importlib
+    from copy import deepcopy
+    from pathlib import Path
+    from hermes_cli.config import load_config_readonly
+    from hermes_constants import get_hermes_home
+    from agent.secret_scope import current_secret_scope_home
+
+    try:
+        _validate_controlled_args(args)
+        owner = current_secret_scope_home()
+        if not owner or Path(owner).resolve() != get_hermes_home().resolve():
+            raise ControlledImageError("runtime_scope_required", "A matching runtime credential scope is required.")
+        config = deepcopy(load_config_readonly())
+        provider, model = _controlled_selection(config)
+        native = importlib.import_module("plugins.image_gen.openai-codex")
+        outcome = native.OpenAICodexImageGenProvider().generate(
+            args["prompt"], args.get("aspect_ratio", "square"), controlled_model=model)
+        if outcome.get("success") is not True:
+            raise ControlledImageError("provider_error", "Configured Codex generation failed.")
+        result = {"success": True, "image": outcome["image"], "provider": provider, "requested_model": model,
+                  "modality": "text", "upscaled": False}
+    except ControlledImageError as exc:
+        result = {"success": False, "image": None, "error_type": exc.code, "error": str(exc)}
+    except Exception:
+        result = {"success": False, "image": None, "error_type": "configuration_error",
+                  "error": "Could not resolve the configured image backend."}
+    return json.dumps(result)

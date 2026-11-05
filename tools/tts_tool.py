@@ -130,14 +130,27 @@ def _default_output_dir() -> str:
     return _get_default_output_dir()
 
 
-def _load_tts_config() -> dict[str, Any]:
-    """Return the ``tts`` config section ({} when unavailable)."""
+def _load_tts_config(*, strict: bool = False) -> dict[str, Any]:
+    """Return the TTS section; strict callers reject failed/defaulted config reads."""
     try:
         from hermes_cli.config import load_config
-        return load_config().get("tts") or {}
+        config = load_config()
+        if strict:
+            from hermes_cli.config_read_errors import FailedConfigRead
+            if isinstance(config, FailedConfigRead) or not isinstance(config, dict):
+                raise ValueError("TTS config unavailable")
+            section = config.get("tts", {})
+            if not isinstance(section, dict):
+                raise ValueError("TTS config must be a mapping")
+            return section
+        return config.get("tts") or {}
     except ImportError:
+        if strict:
+            raise
         logger.debug("hermes_cli.config not available, using default TTS config")
     except Exception as e:
+        if strict:
+            raise
         logger.warning("Failed to load TTS config: %s", e, exc_info=True)
     return {}
 
@@ -502,13 +515,36 @@ def _synthesize_chunks(chunks: list[str], base_path: Path, generated_artifacts: 
 def text_to_speech_tool(
     text: str, output_path: Optional[str] = None, speed: Optional[float] = None,
     instructions: Optional[str] = None, provider: Optional[str] = None,
-    voice_id: Optional[str] = None, find_voices: Optional[dict[str, Any]] = None) -> str:
+    voice_id: Optional[str] = None, find_voices: Optional[dict[str, Any]] = None,
+    *, controlled: bool = False) -> str:
     """Convert text to speech with long-form chunking; returns the JSON result envelope.
 
     Text is normalized, split into provider-safe chunks (never silently truncated), synthesized
     sequentially, then packed against the platform's upload limit: a failed combine keeps the
     separate valid files and no over-limit artifact is ever returned. ``find_voices`` (ElevenLabs
-    only) searches voices instead of speaking."""
+    only) searches voices instead of speaking.
+
+    ``controlled=True`` is an internal opt-in, not a model schema field. The caller
+    supplies a fresh absolute .mp3 path and owns the bounded worker/runtime scope.
+    It rejects long text instead of chunking, never installs or falls back, and
+    returns one artifact without MEDIA tags. Audited backends: Edge (pinned SDK
+    7.2.7/7.3.1), OpenAI/Nous, pinned-model DeepInfra, MiniMax and xAI (no tag rewrite).
+    Other backends fail closed; default calls retain their original behavior.
+    This is not a hard wall-clock deadline or a full audio decoder.
+    """
+    if controlled:
+        from tools.tts_tool_delivery import _controlled_text_to_speech
+        try:
+            return _controlled_text_to_speech(
+                text, output_path, speed=speed, instructions=instructions, provider=provider,
+                voice_id=voice_id, find_voices=find_voices)
+        except ImportError:
+            return _error_json("controlled_tts_dependency_missing")
+        except ValueError:
+            return _error_json("controlled_tts_config_invalid")
+        except Exception:
+            # Backend errors can contain credentials, URLs or transcript text. Do not log them.
+            return _error_json("controlled_tts_generation_failed")
     if find_voices is not None:  # {} = browse with the defaults
         return _find_voices(find_voices)
     if not text or not text.strip():

@@ -107,6 +107,110 @@ _OPUS_VOICE_ARGS = [
     "-application", "voip", "-compression_level", "10"]
 
 
+def _controlled_tts_config(speed: Optional[float]) -> dict[str, Any]:
+    """Own one deep snapshot; conflicting legacy route selectors fail closed."""
+    import copy
+    from utils import is_truthy_value
+
+    origin = _origin()
+    config = copy.deepcopy(origin._load_tts_config(strict=True))
+    selected = config.get("provider", "edge")
+    if not isinstance(selected, str) or not selected.strip():
+        raise ValueError("Invalid TTS provider")
+    selected = selected.strip().lower()
+    if (is_truthy_value(config.get("use_gateway")) and selected != "nous") or any(
+        str(config[key]).strip().lower() != selected
+        for key in ("backend", "cloud_provider") if config.get(key)
+    ):
+        raise ValueError("Conflicting TTS provider selection")
+    config["provider"] = selected
+    return origin._apply_call_overrides(config, speed, None)[0]
+
+
+def _synthesize_controlled_tts(
+    provider: str, text: str, file_str: str, config: dict[str, Any], instructions: Optional[str],
+) -> None:
+    """Only audited native handlers, with passive imports and no fallback dispatcher."""
+    import asyncio
+    import importlib
+    from functools import partial
+
+    origin = _origin()
+    if provider == "edge":
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            raise RuntimeError("Controlled TTS must run on the caller's synchronous worker")
+        # The caller owns a bounded synchronous worker. No nested pool or timeout that
+        # could release that slot while an abandoned helper thread is still running.
+        asyncio.run(origin._generate_edge_tts(text, file_str, config, controlled=True))
+        return
+    importlib.import_module("openai" if provider in {"openai", "deepinfra"} else "requests")
+    generator = {
+        "openai": partial(origin._generate_openai_tts, controlled=True, instructions=instructions),
+        "deepinfra": partial(origin._generate_deepinfra_tts, controlled=True),
+        "minimax": partial(origin._generate_minimax_tts, controlled=True),
+        "xai": partial(origin._generate_xai_tts, controlled=True),
+    }[provider]
+    generator(text, file_str, config)
+
+
+def _controlled_text_to_speech(text: str, output_path: Optional[str], **overrides) -> str:
+    """Short MP3 artifact only, on the caller's bounded worker.
+
+    600 raw/normalized characters and 2 MiB are conservative application limits, not
+    provider/QQ limits. Container sniffing is NOT a full decode or duration check:
+    the trusted caller must validate bytes/duration and path confinement before sending.
+    No media tag is returned: this internal entry is not an auto-delivery tool result.
+    """
+    import json
+
+    origin = _origin()
+    if any(overrides.get(key) is not None for key in ("provider", "voice_id", "find_voices")):
+        return origin._error_json("controlled_tts_override_unsupported")
+    if (not isinstance(output_path, str) or not Path(output_path).is_absolute()
+            or Path(output_path).suffix != ".mp3" or os.path.lexists(output_path)):
+        return origin._error_json("controlled_tts_output_invalid")
+    from tools.tts_text_normalize import prepare_spoken_text
+    if not isinstance(text, str) or not 0 < len(text) <= 600:
+        return origin._error_json("controlled_tts_text_limit")
+    text = prepare_spoken_text(text, max_chars=None)
+    if not text or len(text) > 600:
+        return origin._error_json("controlled_tts_text_limit")
+    try:
+        config = _controlled_tts_config(overrides.get("speed"))
+    except Exception:
+        return origin._error_json("controlled_tts_config_invalid")
+    selected = config["provider"]
+    provider = origin._get_provider(config)
+    if provider not in {"edge", "openai", "deepinfra", "minimax", "xai"}:
+        return origin._error_json("controlled_tts_unsupported_provider")
+    if len(text) > _resolve_max_text_length(provider, config):
+        return origin._error_json("controlled_tts_text_limit")
+    base_path, error = origin._resolve_output_base(output_path, provider, None, False)
+    if error:
+        return origin._error_json("controlled_tts_output_invalid")
+    file_str = str(base_path)
+    succeeded = False
+    try:
+        _synthesize_controlled_tts(provider, text, file_str, config, overrides.get("instructions"))
+        if (not base_path.is_file() or base_path.is_symlink()
+                or not 0 < base_path.stat().st_size <= 2 * 1024 * 1024
+                or _sniff_audio_container(file_str) != "mp3"):
+            return origin._error_json("controlled_tts_audio_invalid")
+        succeeded = True
+        return json.dumps({
+            "success": True, "file_path": file_str, "file_paths": [file_str],
+            "provider": provider, "selected_provider": selected, "voice_compatible": False,
+            "chunk_count": 1, "delivery_file_count": 1, "combined_chunks": False,
+        })
+    finally:
+        if not succeeded:
+            _remove_quietly(file_str)
+
+
 # --- Text chunking and delivery profiles ---
 @dataclass(frozen=True)
 class AudioDeliveryProfile:

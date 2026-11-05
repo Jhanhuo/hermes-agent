@@ -149,10 +149,19 @@ def _write_bytes(output_path: str, audio_bytes: bytes) -> str:
     return output_path
 
 
-def _post_json(url: str, payload: dict[str, Any], headers: dict[str, str], **extra: Any):
+def _post_json(
+    url: str, payload: dict[str, Any], headers: dict[str, str], *, controlled: bool = False, **extra: Any,
+):
     """Streaming ``requests.post`` with the shared 60s timeout (body read via the bounded readers)."""
     import requests
-    return requests.post(url, headers=headers, json=payload, timeout=60, stream=True, **extra)
+    if controlled:
+        extra["allow_redirects"] = False
+    response = requests.post(url, headers=headers, json=payload, timeout=60, stream=True, **extra)
+    # requests.raise_for_status accepts 3xx, including responses carrying audio.
+    if controlled and 300 <= response.status_code < 400:
+        _close_response(response)
+        raise RuntimeError("Controlled TTS redirects are not allowed")
+    return response
 
 
 # --- Auxiliary-model speech-tag rewrites ---
@@ -193,14 +202,46 @@ def _rewrite_with_auxiliary_model(
 
 
 # --- Edge TTS (free default) ---
-async def _generate_edge_tts(text: str, output_path: str, tts_config: dict[str, Any]) -> str:
-    edge_tts = _origin()._import_edge_tts()
+def _controlled_edge_client(edge_tts):
+    """Keep the pinned native transport/save path, but bypass its 403 retry handler.
+
+    Audited edge-tts 7.2.7 (installed runtime) and 7.3.1 (checkout pin) catch
+    ClientResponseError around __stream,
+    changes process-wide DRM clock state and retries. Translating that exception on
+    a per-call subclass prevents both, without patching the SDK or duplicating its
+    provider implementation. A version/seam change requires another audit.
+    """
+    from aiohttp import ClientResponseError
+
+    if (getattr(edge_tts, "__version__", None) not in {"7.2.7", "7.3.1"}
+            or not callable(getattr(edge_tts.Communicate, "_Communicate__stream", None))):
+        raise ValueError("Controlled Edge TTS requires an audited edge-tts 7.2.7 or 7.3.1 SDK")
+
+    class SingleAttemptCommunicate(edge_tts.Communicate):
+        async def _Communicate__stream(self):
+            try:
+                async for message in super()._Communicate__stream():
+                    yield message
+            except ClientResponseError:
+                raise RuntimeError("Controlled Edge TTS request failed") from None
+
+    return SingleAttemptCommunicate
+
+
+async def _generate_edge_tts(
+    text: str, output_path: str, tts_config: dict[str, Any], *, controlled: bool = False,
+) -> str:
+    if controlled:
+        import edge_tts  # Passive import: never the lazy-installing origin importer.
+    else:
+        edge_tts = _origin()._import_edge_tts()
     edge_config = tts_config.get("edge") or {}
     speed = float(edge_config.get("speed", tts_config.get("speed", 1.0)))
     kwargs = {"voice": edge_config.get("voice", DEFAULT_EDGE_VOICE)}
     if speed != 1.0:
         kwargs["rate"] = f"{round((speed - 1.0) * 100):+d}%"
-    await edge_tts.Communicate(text, **kwargs).save(output_path)
+    communicate = _controlled_edge_client(edge_tts) if controlled else edge_tts.Communicate
+    await communicate(text, **kwargs).save(output_path)
     return output_path
 
 
@@ -284,7 +325,9 @@ def _clamped_number(raw: Any, cast, lo, hi):
     return max(lo, min(hi, raw))
 
 
-def _generate_xai_tts(text: str, output_path: str, tts_config: dict[str, Any]) -> str:
+def _generate_xai_tts(
+    text: str, output_path: str, tts_config: dict[str, Any], *, controlled: bool = False,
+) -> str:
     from tools.xai_http import resolve_xai_http_credentials
 
     # TTS is API-billed: a subscription OAuth bearer can authorize chat while
@@ -300,7 +343,7 @@ def _generate_xai_tts(text: str, output_path: str, tts_config: dict[str, Any]) -
     sample_rate, bit_rate = (int(xai_config.get("sample_rate", DEFAULT_XAI_SAMPLE_RATE)),
                              int(xai_config.get("bit_rate", DEFAULT_XAI_BIT_RATE)))
     auto_speech_tags = xai_config.get("auto_speech_tags", xai_config.get("speech_tags"))
-    if _config_bool(auto_speech_tags, DEFAULT_XAI_AUTO_SPEECH_TAGS):
+    if not controlled and _config_bool(auto_speech_tags, DEFAULT_XAI_AUTO_SPEECH_TAGS):
         text = _apply_xai_auto_speech_tags(text)
     # ``tts.xai.<knob>`` overrides global ``tts.<knob>``; out-of-range values are clamped into the
     # API's band rather than 400ing the request.
@@ -336,7 +379,7 @@ def _generate_xai_tts(text: str, output_path: str, tts_config: dict[str, Any]) -
         payload["text_normalization"] = True
     response = _post_json(f"{base_url}/tts", payload, {
         "Authorization": f"Bearer {api_key}", "Content-Type": "application/json",
-        "User-Agent": hermes_xai_user_agent()})
+        "User-Agent": hermes_xai_user_agent()}, controlled=controlled)
     response.raise_for_status()
     return _write_bytes(output_path, _read_tts_response_bytes(response, label="xAI TTS"))
 
@@ -390,7 +433,9 @@ def _raise_minimax_api_error(result: dict[str, Any]) -> None:
             f"MiniMax TTS API error (code {status_code}): {base_resp.get('status_msg', 'unknown error')}")
 
 
-def _generate_minimax_tts(text: str, output_path: str, tts_config: dict[str, Any]) -> str:
+def _generate_minimax_tts(
+    text: str, output_path: str, tts_config: dict[str, Any], *, controlled: bool = False,
+) -> str:
     """Generate audio via MiniMax: ``t2a_v2`` (nested payload, JSON reply with hex audio) or the legacy
     ``text_to_speech`` endpoint (flat payload, raw ``audio/*`` body), detected from the URL."""
     runtime = _resolve_minimax_tts_runtime(tts_config)
@@ -421,7 +466,7 @@ def _generate_minimax_tts(text: str, output_path: str, tts_config: dict[str, Any
     else:
         payload = {"model": model, "text": text, "voice_id": voice_id}
     response = _post_json(base_url, payload, {
-        "Content-Type": "application/json", "Authorization": f"Bearer {runtime.api_key}"})
+        "Content-Type": "application/json", "Authorization": f"Bearer {runtime.api_key}"}, controlled=controlled)
     if is_t2a_v2:
         response.raise_for_status()
         result = _read_tts_response_json(response, label="MiniMax TTS")
