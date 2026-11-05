@@ -108,7 +108,7 @@ def test_one_upload_then_one_anchored_image_on_existing_client(harness, mime):
     assert json.loads(upload.content) == {
         "file_type": 1, "file_data": base64.b64encode(image).decode("ascii"), "srv_send_msg": False}
     assert json.loads(final.content) == {
-        "msg_type": 7, "media": {"file_info": "opaque-file-secret"},
+        "msg_type": 7, "content": " ", "media": {"file_info": "opaque-file-secret"},
         "msg_id": "incoming-id", "msg_seq": 1}
     for req in harness.requests:
         assert req.method == "POST"

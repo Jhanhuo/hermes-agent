@@ -37,6 +37,7 @@ _MAX_ERROR_BODY_CHARS = 500
 
 _MAX_REFERENCE_IMAGES = 16
 _MAX_INPUT_IMAGE_BYTES = 25 * 1024 * 1024
+_CONTROLLED_IMAGE_MAX_BYTES = 2 * 1024 * 1024
 # The edit endpoint accepts raster only; the shared sniffer also knows SVG/TIFF/ICO, which it rejects.
 _ACCEPTED_INPUT_MIME = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
 
@@ -191,7 +192,7 @@ def _build_image_request(
 
 def _post_image_request(
     token: str, *, prompt: str, size: str, quality: str, input_images: Optional[list[dict[str, str]]] = None,
-    base_url: str,
+    base_url: str, controlled: bool = False,
 ) -> dict[str, Any]:
     """POST to the native Codex images endpoint; return the decoded JSON body plus
     ``imagegen_request_id`` (backend correlation id, for support tickets).
@@ -209,13 +210,27 @@ def _post_image_request(
     })
     path, body = _build_image_request(prompt=prompt, size=size, quality=quality, input_images=input_images)
     timeout = httpx.Timeout(300.0, connect=30.0, read=300.0, write=60.0, pool=30.0)
-    with httpx.Client(timeout=timeout, headers=headers) as http:
-        response = http.post(f"{base_url}/{path}", json=body)
+    options = {"follow_redirects": False} if controlled else {}
+    with httpx.Client(timeout=timeout, headers=headers, **options) as http:
+        if controlled:
+            with http.stream("POST", f"{base_url}/{path}", json=body) as response:
+                if not 200 <= response.status_code < 300:
+                    raise RuntimeError("Controlled Codex image request failed")
+                content = bytearray()
+                for chunk in response.iter_bytes(64 * 1024):
+                    if len(content) + len(chunk) > 3 * 1024 * 1024:
+                        raise ValueError("Controlled image response exceeds size cap")
+                    content.extend(chunk)
+                payload = json.loads(content)
+        else:
+            response = http.post(f"{base_url}/{path}", json=body)
+            payload = None
     if response.status_code >= 400:
         raise RuntimeError(
             f"Codex images API returned HTTP {response.status_code}: "
             f"{_summarize_error_body(response.text)}")
-    payload = response.json()
+    if not controlled:
+        payload = response.json()
     if not isinstance(payload, dict):
         raise RuntimeError("Codex images API returned a non-object body")
     payload["imagegen_request_id"] = response.headers.get("x-codex-imagegen-request-id")
@@ -230,6 +245,15 @@ def _png_pixel_size(raw: bytes) -> Optional[str]:
         return None
     width, height = struct.unpack(">II", raw[16:24])
     return f"{width}x{height}"
+
+
+def _controlled_image_bytes(value: str) -> bytes:
+    if len(value) > ((_CONTROLLED_IMAGE_MAX_BYTES + 2) // 3) * 4:
+        raise ValueError("Controlled image exceeds size cap")
+    raw = base64.b64decode(value, validate=True)
+    if not raw or len(raw) > _CONTROLLED_IMAGE_MAX_BYTES:
+        raise ValueError("Controlled image exceeds size cap")
+    return raw
 
 
 class OpenAICodexImageGenProvider(StaticImageGenProvider):
@@ -264,6 +288,7 @@ class OpenAICodexImageGenProvider(StaticImageGenProvider):
     def generate(
         self, prompt: str, aspect_ratio: str = DEFAULT_ASPECT_RATIO, *,
         image_url: Optional[str] = None, reference_image_urls: Optional[list[str]] = None,
+        controlled_model: Optional[str] = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
         prompt = (prompt or "").strip()
@@ -277,7 +302,8 @@ class OpenAICodexImageGenProvider(StaticImageGenProvider):
             return error_factory("openai-codex", aspect)(
                 "httpx Python package not installed (pip install httpx)", "missing_dependency")
 
-        tier_id, meta = _resolve_model()
+        tier_id, meta = ((controlled_model, GPT_IMAGE_2_TIERS[controlled_model])
+                         if controlled_model is not None else _resolve_model())
         size = size_for(aspect)
         fail = error_factory("openai-codex", aspect, model=tier_id, prompt=prompt)
         try:
@@ -288,18 +314,23 @@ class OpenAICodexImageGenProvider(StaticImageGenProvider):
         try:
             payload = _post_image_request(
                 token, prompt=prompt, size=size, quality=meta["quality"], input_images=input_images or None,
-                base_url=base_url)
+                base_url=base_url, **({"controlled": True} if controlled_model is not None else {}))
         except Exception as exc:
+            if controlled_model is not None:
+                return fail("Controlled Codex image generation failed", "api_error")
             logger.debug("Codex image generation failed", exc_info=True)
             return fail(f"OpenAI image generation via Codex auth failed: {exc}", "api_error")
 
         data = payload.get("data")
+        if controlled_model is not None and (not isinstance(data, list) or len(data) != 1):
+            return fail("Controlled generation requires exactly one image", "provider_contract")
         b64 = data[0].get("b64_json") if isinstance(data, list) and data and isinstance(data[0], dict) else None
         if not isinstance(b64, str) or not b64:
             return fail("Codex images API response contained no image data", "empty_response")
 
         try:
-            pixel_size = _png_pixel_size(base64.b64decode(b64))
+            raw = (_controlled_image_bytes(b64) if controlled_model is not None else base64.b64decode(b64))
+            pixel_size = _png_pixel_size(raw)
             saved_path = save_b64_image(b64, prefix=f"openai_codex_{tier_id}")
         except Exception as exc:
             return fail(f"Could not save image to cache: {exc}", "io_error")

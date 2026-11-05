@@ -89,6 +89,17 @@ class OwnedGroupTicket:
         uses routed-runtime scope while transport authorization is checked in
         the receiving profile before/after it. It is never serialized.
         """
+        return await self._submit_media(image_data, mime_type, recheck=recheck, audio=False)
+
+    async def submit_audio(self, data: bytes, mime_type: str, *, recheck) -> StrictSendResult:
+        """Submit bounded MP3 bytes on this ticket's original receiving transport.
+
+        Like images, the caller owns the shared ledger and policy recheck. This
+        does not synthesize, transcode, retry or automatically deliver anything.
+        """
+        return await self._submit_media(data, mime_type, recheck=recheck, audio=True)
+
+    async def _submit_media(self, data, mime_type, *, recheck, audio):
         binding = self._binding
         if binding is None:
             return StrictSendResult("rejected", reason="owned_authorization_revoked")
@@ -108,8 +119,10 @@ class OwnedGroupTicket:
                 return (self._binding is binding and binding.adapter is adapter
                         and self.authorized())
 
-            return await adapter.send_group_image_reply_once(
-                group_id=self.group_id, message_id=self.message_id, image_data=image_data,
+            sender = adapter.send_group_audio_reply_once if audio else adapter.send_group_image_reply_once
+            payload = {"audio_data" if audio else "image_data": data}
+            return await sender(
+                group_id=self.group_id, message_id=self.message_id, **payload,
                 mime_type=mime_type, message_time=self.message_time, expected_app_id=self.bot_id,
                 recheck=authorized_recheck)
 
