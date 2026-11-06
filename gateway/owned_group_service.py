@@ -61,17 +61,39 @@ class OwnedGroupTicket:
     addressed: bool
     runtime_home: Path
     ledger_path: Path
+    images_v1: tuple[str, ...] = ()
     _binding: Any = field(default=None, repr=False, compare=False)
 
     def as_record(self) -> dict:
-        return {f.name: str(value) if isinstance(value := getattr(self, f.name), Path) else value
-                for f in fields(self) if not f.name.startswith("_")}
+        record = {f.name: str(value) if isinstance(value := getattr(self, f.name), Path) else value
+                  for f in fields(self) if not f.name.startswith("_") and f.name != "images_v1"}
+        if self.images_v1:
+            record["images_v1"] = list(self.images_v1)
+        return record
 
     def authorized(self) -> bool:
         try:
             return self._binding is not None and self._binding.authorized(self)
         except Exception:
             return False
+
+    async def load_images(self, *, recheck) -> tuple[dict, ...]:
+        """Load this message's process-local images after the caller claims work.
+
+        Recheck is mandatory, ephemeral and executed in the routed runtime;
+        transport authorization and the original 285-second anchor surround it.
+        Any denial or invalid media yields an empty tuple, never a fallback URL.
+        """
+        binding = self._binding
+        if binding is None or not self.images_v1:
+            return ()
+        return await binding.host._service.images.load(self, recheck=recheck)
+
+    def release_images(self) -> None:
+        """Release this message's media on a terminal outcome (not on wait)."""
+        binding = self._binding
+        if binding is not None and self.images_v1:
+            binding.host._service.images.release(binding.adapter, self.as_record())
 
     async def submit(self, text: str) -> StrictSendResult:
         if not self.authorized():
@@ -177,12 +199,24 @@ class _Binding:
 
 class OwnedGroupService(OwnedGroupLifecycle):
 
+    def __init__(self, runner):
+        super().__init__(runner)
+        from gateway.owned_group_images import ImageRegistry
+        self.images = ImageRegistry()
+
+    async def shutdown(self, timeout=5.0):
+        self.images.close()
+        return await super().shutdown(timeout=timeout)
+
     def alive(self):
+        self.images.prune()
         return (not self.closed and getattr(self.runner, "_running", False) is True
                 and not getattr(self.runner, "_draining", False)
                 and not getattr(self.runner, "_external_drain_active", False))
 
     def context(self, runtime_id, runtime_home):
+        # The existing ticker reaches here even with no consumer or a failed lookup.
+        self.images.prune()
         from hermes_cli.plugins import get_plugin_manager
         with _scope(runtime_home):
             manager = get_plugin_manager()
@@ -197,13 +231,18 @@ class OwnedGroupService(OwnedGroupLifecycle):
     def restore(self, host, record):
         from plugins.platforms.qqbot.strict_send import _input_error, _valid_message_id
         names = {f.name for f in fields(OwnedGroupTicket) if not f.name.startswith("_")}
-        required = names - {"runtime_home", "ledger_path"}
+        required = names - {"runtime_home", "ledger_path", "images_v1"}
         if (type(record) is not dict or not required <= set(record) <= names
                 or type(record["addressed"]) is not bool):
             return None
+        images = record.get("images_v1", [])
+        if (type(images) is not list or len(images) > 4
+                or not all(type(value) is str and 32 <= len(value) <= 128 for value in images)):
+            return None
         if (not all(_valid_message_id(record[k]) for k in (
                 "bot_id", "runtime_id", "transport_profile", "user_id", "session_id"))
-                or _input_error(record["group_id"], record["message_id"], record["text"])):
+                or _input_error(record["group_id"], record["message_id"],
+                                record["text"] or ("image" if images else ""))):
             return None
         runner = self.runner
         profile = record["transport_profile"]
@@ -213,10 +252,12 @@ class OwnedGroupService(OwnedGroupLifecycle):
         adapter = adapters.get(Platform.QQBOT)
         if adapter is None:
             return None
-        identity = self.validate(host, adapter, record)
+        validation_record = dict(record)
+        validation_record.setdefault("runtime_home", str(host.runtime_home))
+        identity = self.validate(host, adapter, validation_record)
         if identity is None:
             return None
-        values = dict(record, runtime_home=identity.runtime_home,
+        values = dict(record, images_v1=tuple(images), runtime_home=identity.runtime_home,
                       ledger_path=identity.authorization_home / "plugin-data/owned-group-outbound/state.db")
         ticket = OwnedGroupTicket(**values)
         object.__setattr__(ticket, "_binding", _Binding(host, adapter, identity.authorization_home, ticket.as_record()))
@@ -224,7 +265,9 @@ class OwnedGroupService(OwnedGroupLifecycle):
 
     def validate(self, host, adapter, record):
         """Rebuild from live received transport, with no persisted runtime override."""
-        if not host.alive() or not _fresh(record["message_time"]):
+        self.images.prune()
+        if (not host.alive() or not _fresh(record["message_time"])
+                or (record.get("images_v1") and not self.images.matches(adapter, record))):
             return None
         runner = self.runner
         registered, owner = runner._owning_profile(adapter, Platform.QQBOT)
@@ -258,14 +301,15 @@ class OwnedGroupService(OwnedGroupLifecycle):
     def ticket(self, event, host, identity, *, require_addressed=True):
         raw = event.raw_message if isinstance(event.raw_message, dict) else {}
         message_time = platform_time(raw.get("timestamp"))
+        images = event.metadata.get("images_v1", ())
         if (message_time is None or event.message_type != MessageType.TEXT
-                or not isinstance(event.text, str) or not event.text.strip()
+                or not isinstance(event.text, str) or (not event.text.strip() and not images)
                 or not isinstance(event.message_id, str) or not event.message_id
                 or (require_addressed and event.reply_expected is not True)):
             return None
         from plugins.platforms.qqbot.strict_send import _input_error, _valid_message_id
         if (not _valid_message_id(event.source.user_id)
-                or _input_error(event.source.chat_id, event.message_id, event.text)):
+                or _input_error(event.source.chat_id, event.message_id, event.text or ("image" if images else ""))):
             return None
         adapter = self.runner._intake_adapter_for(event.source)
         if identity.transport_inferred or identity.adapter() is not adapter:
@@ -278,8 +322,10 @@ class OwnedGroupService(OwnedGroupLifecycle):
             transport_profile=identity.transport_profile, group_id=event.source.chat_id,
             user_id=event.source.user_id, session_id=self.runner._session_key_for_source(event.source),
             message_id=event.message_id, message_time=message_time, text=event.text,
-            addressed=event.reply_expected is True, runtime_home=identity.runtime_home,
+            images_v1=images, addressed=event.reply_expected is True, runtime_home=identity.runtime_home,
             ledger_path=identity.authorization_home / "plugin-data/owned-group-outbound/state.db")
+        if images:
+            self.images.bind_text(adapter, ticket.as_record())
         binding = _Binding(host, adapter, identity.authorization_home, ticket.as_record())
         object.__setattr__(ticket, "_binding", binding)
         return ticket if ticket.authorized() else None
@@ -312,7 +358,8 @@ async def observe(runner, envelope, source):
             return
         event = MessageEvent(text=payload.get("text"), source=source,
                              message_id=payload.get("message_id"), reply_expected=payload["is_mention"],
-                             raw_message={"timestamp": payload.get("message_timestamp")})
+                             raw_message={"timestamp": payload.get("message_timestamp")},
+                             metadata={"images_v1": tuple(payload.get("images_v1", ()))})
         if event.is_command():
             return
         service = service_for(runner)
