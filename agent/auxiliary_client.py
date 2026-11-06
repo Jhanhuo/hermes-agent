@@ -37,6 +37,7 @@ from agent.auxiliary_error_shapes import (
     _botocore_error, _exc_http_status, _is_invalid_aux_response_error, _is_statusless_structured_provider_error,
 )
 from agent.auxiliary_managed_local import _is_managed_local_endpoint
+from agent.auxiliary_request_guard import check_auxiliary_request, check_auxiliary_request_sync
 from agent.auxiliary_reasoning_floor import remember_reasoning_floor, with_reasoning_floor
 from agent.auxiliary_structured_output import _route_key, _without_structured_output_format, remember_structured_output_rejection
 from agent.codex_headers import (
@@ -1567,6 +1568,7 @@ class _CodexCompletionsAdapter:
             from agent.sdk_transform_bypass import bypass_sdk_request_transform
             # Keep bulk wire payload out of the SDK's GIL-holding request transform.
             stream_kwargs = bypass_sdk_request_transform({**resp_kwargs, "stream": True})
+            check_auxiliary_request_sync()
             event_stream = self._client.responses.create(**stream_kwargs)
             guard.adopt_stream(event_stream)
             # The timer may fire while responses.create() is blocked; if the cancelled attempt
@@ -1626,7 +1628,10 @@ class _AsyncCompletionsAdapter:
 
     async def create(self, **kwargs) -> Any:
         import asyncio
-        return await asyncio.to_thread(self._sync.create, **kwargs)
+        def create():
+            check_auxiliary_request_sync()
+            return self._sync.create(**kwargs)
+        return await asyncio.to_thread(create)
 
 
 class _AsyncAuxiliaryClientBase:
@@ -2623,7 +2628,10 @@ def _relay_sync_completion(
     relay_context = _RELAY_AUX_CALL_CONTEXT.get() or {}
     task = relay_context.get("task")
     relay_context["stream_provider"] = provider or relay_context.get("provider")
-    callback = create or (lambda request: _create_with_progress(client, request, task))
+    provider_create = create or (lambda request: _create_with_progress(client, request, task))
+    def callback(request):
+        check_auxiliary_request_sync()
+        return provider_create(request)
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
     # Isolate only the provider callback so the owning thread can unwind its lease/DB
     # transaction on hard cancel without touching the shared client.
@@ -2655,8 +2663,11 @@ async def _relay_async_completion(
     from agent.auxiliary_wire import prepare_chat_messages, relay_chat_metadata
 
     kwargs = prepare_chat_messages(client, kwargs)
-    # Async twin of the seam default above (#98466).
-    callback = create or (lambda request: _acreate_with_progress(client, request))
+    # Gate inside Relay's callback: auxiliary observers and Relay can wait first.
+    provider_create = create or (lambda request: _acreate_with_progress(client, request))
+    async def callback(request):
+        await check_auxiliary_request()
+        return await provider_create(request)
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
     if route is None:
         return await callback(kwargs)
@@ -2686,7 +2697,10 @@ def _relay_sync_stream(
     kwargs = prepare_chat_messages(client, kwargs)
     # The bypass runs inside the provider callback, AFTER Relay has seen (and possibly
     # rewritten) the real conversation; applying it to `kwargs` would hand Relay an empty one.
-    create = lambda request: client.chat.completions.create(**bypass_chat_sdk_request_transform(request, client))
+    def create(request):
+        request = bypass_chat_sdk_request_transform(request, client)
+        check_auxiliary_request_sync()
+        return client.chat.completions.create(**request)
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
     if route is None:
         return create(kwargs)
@@ -7006,12 +7020,14 @@ def _create_with_progress_once(
     # total ceiling instead of idling out (#114938). Progress ticks only for
     # substantive stream payloads or a completed usable response.
     if (not _aux_progress_active() and not force_stream) or _client_streams_internally(client):
+        check_auxiliary_request_sync()
         response = client.chat.completions.create(**kwargs)
         if not _client_streams_internally(client):
             _notify_aux_provider_response()
         return response
     stream_kwargs, model, total_ceiling = _stream_request_plan(kwargs, client)
     try:
+        check_auxiliary_request_sync()
         chunks = client.chat.completions.create(**stream_kwargs)
     except Exception as exc:
         # Genuine provider failures aren't streaming's fault — surface unchanged so the
@@ -7024,6 +7040,7 @@ def _create_with_progress_once(
         logger.debug("Auxiliary %s: streamed request failed (%s); retrying non-streaming",
                      task or "call", exc)
         _notify_aux_dispatch()
+        check_auxiliary_request_sync()
         response = client.chat.completions.create(**kwargs)
         _notify_aux_provider_response()
         return response
@@ -7217,6 +7234,7 @@ async def _aggregate_chat_stream_async(
 async def _acreate_with_stream(client: Any, kwargs: dict[str, Any], task: Optional[str] = None) -> Any:
     """Async create() for stream-only providers: ``stream=True`` + aggregate the async chunks."""
     stream_kwargs, model, total_ceiling = _stream_request_plan(kwargs, client)
+    await check_auxiliary_request()
     chunks = await client.chat.completions.create(**stream_kwargs)
     if hasattr(chunks, "choices"):  # shims may hand back a complete response despite stream=True
         return chunks
@@ -7237,12 +7255,14 @@ async def _acreate_with_progress(
     _notify_aux_dispatch()
     # Same contract as the sync twin (#114938): dispatch alone is not progress.
     if (not _aux_progress_active() and not force_stream) or _async_client_streams_internally(client):
+        await check_auxiliary_request()
         response = await client.chat.completions.create(**kwargs)
         if not _async_client_streams_internally(client):
             _notify_aux_provider_response()
         return response
     stream_kwargs, model, total_ceiling = _stream_request_plan(kwargs, client)
     try:
+        await check_auxiliary_request()
         chunks = await client.chat.completions.create(**stream_kwargs)
     except Exception as exc:
         # Only a rejected stream NEGOTIATION falls back to a plain call (mirrors the sync wrapper); a
@@ -7254,6 +7274,7 @@ async def _acreate_with_progress(
         logger.debug("Auxiliary %s: streamed async request failed (%s); retrying non-streaming",
                      task or "call", exc)
         _notify_aux_dispatch()
+        await check_auxiliary_request()
         response = await client.chat.completions.create(**kwargs)
         _notify_aux_provider_response()
         return response
@@ -8211,6 +8232,7 @@ async def async_call_llm(
     if semaphore is not None:
         await semaphore.acquire()
     try:
+        await check_auxiliary_request()
         with scoped_runtime_main(main_runtime):
             return await _async_call_llm_impl(
                 task=task, provider=provider, model=model, base_url=base_url, api_key=api_key,
@@ -8250,6 +8272,7 @@ async def _async_call_llm_impl(
 
         async def _primary(**validate_kw: Any) -> Any:
             import asyncio
+            await check_auxiliary_request()
             return await asyncio.to_thread(
                 _validate_llm_response,
                 await _relay_async_completion(

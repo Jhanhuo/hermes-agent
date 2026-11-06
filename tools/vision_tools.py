@@ -817,16 +817,21 @@ def _debug_call_data(kind: str, source: str, user_prompt: str, model) -> dict:
         "error": None, "success": False, "analysis_length": 0, "model_used": model, f"{kind}_size_bytes": 0}
 
 
-async def _call_vision_llm(call_kwargs: dict, empty_log: str, response=None):
-    """Aux vision LLM analysis text, retrying once on empty content (reasoning-only response).
-    ``response``: an already-made first call (the image path handles size-error retries itself)."""
+async def _call_vision_llm(call_kwargs: dict, empty_log: str, response=None, *, recheck=None):
+    """Aux vision analysis; recheck gates helper calls, including the empty-content retry."""
     _load_auxiliary_client()
+    async def request():
+        if recheck is not None:
+            from tools.interrupt import is_interrupted
+            if is_interrupted() or await recheck() is not True:
+                raise ValueError('Controlled vision request is no longer authorized')
+        return await async_call_llm(**call_kwargs)
     if response is None:
-        response = await async_call_llm(**call_kwargs)
+        response = await request()
     analysis = extract_content_or_reasoning(response)
     if not analysis:
         logger.warning(empty_log)
-        analysis = extract_content_or_reasoning(await async_call_llm(**call_kwargs))
+        analysis = extract_content_or_reasoning(await request())
     return analysis
 
 
@@ -885,11 +890,55 @@ async def _run_analysis(
                     logger.warning("Could not delete temporary file: %s", cleanup_error, exc_info=True)
 
 
+async def _vision_analyze_controlled_data_url(image_url: str, user_prompt: str, recheck) -> str:
+    """Internal prevalidated PNG/JPEG input: memory only, no shared debug/session history.
+
+    The owning boundary validates full image decode. Refuse arbitrary sources here before
+    the native resolver, and reuse auxiliary routing/message parsing without materializing
+    a file. No disk resize fallback; the vision-layer empty-content retry gates again.
+    The auxiliary router retains its routing; a context-local gate covers its attempts.
+    """
+    from agent.auxiliary_request_guard import AuxiliaryRequestDenied, auxiliary_request_scope
+    failure = {'success': False, 'error': 'Controlled image analysis unavailable'}
+    try:
+        if (not callable(recheck) or not isinstance(user_prompt, str)
+                or not isinstance(image_url, str) or len(image_url) > 2_796_228
+                or not image_url.startswith(('data:image/png;base64,', 'data:image/jpeg;base64,'))):
+            return json.dumps(failure)
+        from tools.image_source import ResolveContext, resolve_image_source
+        resolved = await resolve_image_source(image_url, ResolveContext())
+        if (resolved.origin != 'data' or resolved.mime not in ('image/png', 'image/jpeg')
+                or not 0 < len(resolved.data) <= 2 * 1024 * 1024
+                or not image_url.startswith(f'data:{resolved.mime};base64,')):
+            return json.dumps(failure)
+        kwargs = _aux_call_kwargs(_media_messages(user_prompt, 'image_url', image_url), None, 120.0)
+        async def current():
+            from tools.interrupt import is_interrupted
+            return not is_interrupted() and await recheck() is True
+        with auxiliary_request_scope(current):
+            analysis = await _call_vision_llm(kwargs, 'Controlled vision returned empty content', recheck=recheck)
+        if not isinstance(analysis, str) or not analysis.strip():
+            return json.dumps(failure)
+        return json.dumps({'success': True, 'analysis': analysis}, ensure_ascii=False)
+    except (AuxiliaryRequestDenied, Exception):
+        # Neither provider exceptions nor source/data URLs enter shared logs or debug state.
+        return json.dumps(failure)
+
+
 async def vision_analyze_tool(
     image_url: str, user_prompt: str, model: str | None = None,
-    task_id: Optional[str] = None, region: Optional[list] = None) -> str:
-    """Describe an image (URL, local path, data: URL) with the auxiliary vision LLM. ``user_prompt``
-    is pre-formatted by the caller. Temp images live under $HERMES_HOME/cache/vision/."""
+    task_id: Optional[str] = None, region: Optional[list] = None, *,
+    controlled_data_url: bool = False, recheck=None) -> str:
+    """Describe an image with native auxiliary vision routing.
+
+    Ordinary calls materialize temporary images. Internal ``controlled_data_url=True``
+    calls accept only bounded prevalidated PNG/JPEG data URLs, require a live recheck,
+    and never persist inputs or use the shared DebugSession. Not exposed in tool schema.
+    """
+    if controlled_data_url:
+        if model is not None or task_id is not None or region is not None:
+            return json.dumps({'success': False, 'error': 'Controlled image overrides are not supported'})
+        return await _vision_analyze_controlled_data_url(image_url, user_prompt, recheck)
     async def stage(prompt: str, debug_call_data: dict, temp_paths: list) -> tuple:
         prepared = await _prepare_image(image_url, task_id, region, validate_decode=False)
         temp_paths.append(prepared.path)

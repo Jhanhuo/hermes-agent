@@ -838,15 +838,7 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         if not group_openid or not self._is_group_allowed(group_openid, member):
             return
         is_mention = self._group_message_is_mention(event_type, d)
-        # Normalize the same proven self prefix whichever copy wins dedup, so a
-        # full event cannot hide a slash command behind <@!self>. Never remove
-        # another member's token just because this bot also occurs in mentions.
-        self_prefix = (re.match(rf"^<@!?{re.escape(self._bot_user_id)}>\s*", content)
-                       if is_mention and self._bot_user_id else None)
-        if self_prefix:
-            content = content[self_prefix.end():]
-        elif event_type == "GROUP_AT_MESSAGE_CREATE":
-            content = self._strip_at_mention(content)
+        content = self._group_message_content(event_type, d, content)
         member_info = d.get("member") if isinstance(d.get("member"), dict) else {}
         nick = member_info.get("nick") or author.get("username") or author.get("nickname")
         await self._ingest(
@@ -854,6 +846,15 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             event_metadata={"qq_event_type": event_type, "is_mention": is_mention}, reply_expected=is_mention,
             chat_id=group_openid, qq_chat_type="group", user_id=member, chat_type="group",
             user_name=str(nick) if nick else None, is_bot=author.get("bot") is True)
+
+    def _group_message_content(self, event_type, data, content):
+        # Observation and turn admission must strip the same proven self prefix.
+        is_mention = self._group_message_is_mention(event_type, data)
+        prefix = (re.match(rf"^<@!?{re.escape(self._bot_user_id)}>\s*", content)
+                  if is_mention and self._bot_user_id else None)
+        if prefix:
+            return content[prefix.end():]
+        return self._strip_at_mention(content) if event_type == "GROUP_AT_MESSAGE_CREATE" else content
 
     async def _handle_guild_message(self, d, msg_id, content, author, timestamp) -> None:
         channel_id = str(d.get("channel_id", ""))
@@ -910,6 +911,22 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         **source_kwargs: Any) -> None:
         """Shared inbound tail: fold attachment transcripts/file info and quoted context
         into the text, drop empty events, remember the QQ chat kind and dispatch."""
+        owned = False
+        images = ()
+        runner = getattr(self, "gateway_runner", None)
+        if runner is not None and qq_chat_type == "group":
+            from gateway.owned_group_service import selected
+            source = self.build_source(chat_id=chat_id, **source_kwargs)
+            owned = selected(runner, source)
+            if owned:
+                from gateway.owned_group_images import stage
+                images = stage(self, source, d)
+                # Keep the established voice ASR/STT path, but never eagerly
+                # download images, files or reference attachments in owned lanes.
+                attachments = [a for a in attachments if isinstance(a, dict)
+                               and not str(a.get("content_type", "")).lower().startswith("image/")
+                               and self._is_voice_content_type(str(a.get("content_type", "")),
+                                                              str(a.get("filename", "")))] if isinstance(attachments, list) else []
         att = await self._process_attachments(attachments)
         text = content
         voice_transcripts = att["voice_transcripts"]
@@ -921,12 +938,12 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         if verbose:
             logger.info("[%s] After processing: images=%d, voice=%d", self._log_tag, len(image_urls), len(voice_transcripts))
 
-        quoted = await self._process_quoted_context(d)
+        quoted = await self._process_quoted_context(d, text_only=owned)
         text = self._merge_quote_into(text, quoted["quote_block"])
         if quoted["image_urls"]:
             image_urls = image_urls + quoted["image_urls"]
             image_media_types = image_media_types + quoted["image_media_types"]
-        if not text.strip() and not image_urls:
+        if not text.strip() and not image_urls and not images:
             return
 
         self._chat_type_map[chat_id] = qq_chat_type
@@ -935,18 +952,20 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             message_type=self._detect_message_type(image_urls, image_media_types), raw_message=d,
             message_id=msg_id, media_urls=image_urls, media_types=image_media_types,
             timestamp=self._parse_qq_timestamp(timestamp),
-            metadata=event_metadata or {}, reply_expected=reply_expected,
+            metadata=dict(event_metadata or {}, **({"images_v1": images} if images else {})),
+            reply_expected=reply_expected,
         )
         await self.handle_message(event)
 
     # ── Quoted-message handling ──
 
-    async def _process_quoted_context(self, d: dict[str, Any]) -> dict[str, Any]:
+    async def _process_quoted_context(self, d: dict[str, Any], *, text_only: bool = False) -> dict[str, Any]:
         """Process the quoted message a user is replying to (``message_type == 103``;
         referenced content + attachments live in ``msg_elements``). Quoted attachments
         go through _process_attachments so quoted voice gets STT and quoted images are
         cached identically. Returns ``{"quote_block", "image_urls", "image_media_types"}``;
-        quote_block is "" when nothing is quoted."""
+        quote_block is "" when nothing is quoted. Owned lanes use ``text_only``
+        to retain bounded context without fetching referenced attachments."""
         empty = {"quote_block": "", "image_urls": [], "image_media_types": []}
         try:
             is_quote = int(d.get("message_type", 0) or 0) == 103
@@ -955,6 +974,13 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         elements = d.get("msg_elements")
         if not is_quote or not isinstance(elements, list) or not elements:
             return empty
+
+        if text_only:
+            # Read only direct text, not nested forwards, ASR or media locators.
+            parts = [e["content"][:1024].strip() for e in elements[:32]
+                     if isinstance(e, dict) and isinstance(e.get("content"), str)]
+            text = " ".join(part for part in parts if part)[:1024]
+            return dict(empty, quote_block="[Quoted message]:\n" + text) if text else empty
 
         elements = [e for e in elements if isinstance(e, dict)]
         quoted_text_parts = [t for t in (str(e.get("content", "")).strip() for e in elements) if t]

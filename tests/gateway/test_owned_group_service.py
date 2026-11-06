@@ -78,7 +78,8 @@ def rig(tmp_path, monkeypatch):
             values.update(changes)
             return MessageEvent(**values)
         obj = SimpleNamespace(loop=loop, runner=runner, adapter=adapter, event=event, home=home,
-                              runtime=runtime, requests=requests, auth=auth, register=register, managers=managers)
+                              runtime=runtime, requests=requests, auth=auth, register=register, managers=managers,
+                              offline_guard=guard)
         yield obj
         service = getattr(runner, "_owned_group_service", None)
         if service is not None:
