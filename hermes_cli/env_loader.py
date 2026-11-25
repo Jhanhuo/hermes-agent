@@ -209,6 +209,19 @@ def adopt_env_provenance(provenance: dict[str, list[str]]) -> None:
     _MANAGED_DOTENV_KEYS.update(provenance.get("managed", ()))
 
 
+def has_cached_secret_source_names(hermes_home: str | os.PathLike, names: frozenset[str]) -> bool:
+    """Check source evidence without fetching, copying or reading secret values.
+
+    Supplied-name provenance (including skipped writes) has no home attribution,
+    so it cannot rule out an override for this home. Snapshots are home-specific.
+    """
+    home_key = hermes_home_key(hermes_home)
+    with _SECRET_SOURCE_CACHE_LOCK:
+        return (not names.isdisjoint(_SOURCE_SUPPLIED_NAMES) or not names.isdisjoint(_SECRET_SOURCES)
+                or any(not names.isdisjoint(cache.get(home_key, ())) for cache in (
+                    _SECRET_SOURCE_VALUES_BY_HOME, _SECRET_SOURCE_RESTORE_BY_HOME, _SECRET_SOURCE_WRITES_BY_HOME)))
+
+
 def get_secret_source_values(hermes_home: str | os.PathLike) -> dict[str, str]:
     """Return the external-secret value snapshot for ``hermes_home``."""
     return dict(_SECRET_SOURCE_VALUES_BY_HOME.get(hermes_home_key(hermes_home), {}))

@@ -42,3 +42,22 @@ def test_case_variant_reset_evicts_missing_home_snapshot(tmp_path, monkeypatch):
         env_loader.reset_secret_source_cache()
         registry._reset_registry_for_tests()
         reset_hermes_home_key_cache()
+
+
+@pytest.mark.platforms("windows")
+@pytest.mark.parametrize("cache_name", [
+    "_SECRET_SOURCE_VALUES_BY_HOME", "_SECRET_SOURCE_RESTORE_BY_HOME", "_SECRET_SOURCE_WRITES_BY_HOME",
+])
+def test_cached_source_names_use_canonical_home_key(tmp_path, monkeypatch, cache_name):
+    home = tmp_path / "MixedCase"
+    home.mkdir()
+    names = frozenset({"WIN_HOME_KEY_PROBE_TOKEN"})
+    monkeypatch.setattr(env_loader, "_SOURCE_SUPPLIED_NAMES", set())
+    monkeypatch.setattr(env_loader, "_SECRET_SOURCES", {})
+    for name in ("_SECRET_SOURCE_VALUES_BY_HOME", "_SECRET_SOURCE_RESTORE_BY_HOME",
+                 "_SECRET_SOURCE_WRITES_BY_HOME"):
+        monkeypatch.setattr(env_loader, name, {})
+    monkeypatch.setitem(getattr(env_loader, cache_name), hermes_home_key(home), dict.fromkeys(names))
+    assert env_loader.has_cached_secret_source_names(home, names)
+    assert env_loader.has_cached_secret_source_names(Path(str(home).upper()), names)
+    assert not env_loader.has_cached_secret_source_names(tmp_path / "other", names)

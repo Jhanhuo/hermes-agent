@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import time
 import uuid
 from datetime import datetime, timezone, UTC
@@ -39,6 +40,9 @@ except ImportError:
     httpx = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
+from hermes_constants import get_hermes_home
+# The desktop API and scoped plugin-loader aliases must share one witness registry.
+from plugins.platforms.qqbot import discovery
 from gateway.platforms.base import (
     gateway_trust_env, BasePlatformAdapter, ExecApprovalPrompt, SendResult,
     cache_document_from_bytes_async, cache_image_from_bytes_async,
@@ -83,6 +87,11 @@ def check_qq_requirements() -> bool:
 
 def _ws_proxy() -> str | None:  # the WebSocket honours proxy env vars (WSL setups need this)
     return next((v for v in map(os.getenv, ("WSS_PROXY", "wss_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")) if v), None)
+
+
+_MEMBERSHIP_EVENTS = ("GROUP_ADD_ROBOT", "GROUP_DEL_ROBOT")
+_DISCOVERY_EVENTS = ("READY", *_MEMBERSHIP_EVENTS)
+_DISCOVERY_MAINTENANCE_INTERVAL = 60 * 60  # seconds between completed pass and next attempt
 
 
 _VOICE_EXTENSIONS = (".silk", ".amr", ".mp3", ".wav", ".ogg", ".m4a", ".aac", ".speex", ".flac")
@@ -157,6 +166,9 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         if type(self.require_mention) is not bool:
             raise ValueError("QQ require_mention must be a boolean")
         self._app_id = str(extra.get("app_id") or _resolve_qq_secret("QQ_APP_ID", "")).strip()
+        # Multiplex constructs each adapter in its transport owner's home/secret scope.
+        self._discovery_home = get_hermes_home().resolve()
+        self._discovery_epoch: discovery.ReceiverEpoch | None = None
         self._client_secret = str(extra.get("client_secret") or _resolve_qq_secret("QQ_CLIENT_SECRET", "")).strip()
         self._markdown_support = bool(extra.get("markdown_support", True))
         self._dm_policy = str(extra.get("dm_policy", "pairing")).strip().lower()
@@ -270,6 +282,7 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             return False
 
     async def disconnect(self) -> None:
+        self._end_discovery_epoch()
         self._running = False
         self._mark_disconnected()
         await cancel_task(self._listen_task)
@@ -281,6 +294,7 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
 
     async def _close_ws(self) -> None:
         """Close the WebSocket + its aiohttp session (keeps _http_client alive)."""
+        self._end_discovery_epoch()
         if self._ws and not self._ws.closed:
             await self._ws.close()
         self._ws = None
@@ -474,12 +488,51 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             # read and retry with backoff reset → 100% CPU spin. Raise instead.
             raise RuntimeError("WebSocket closed")
 
+        epoch = self._discovery_epoch = discovery.ReceiverEpoch(self)
+        maintenance = asyncio.create_task(self._discovery_maintenance_loop())
+        try:
+            await self._receive_frames(epoch)
+        finally:
+            epoch.close()
+            if self._discovery_epoch is epoch:
+                self._discovery_epoch = None
+            await cancel_task(maintenance)
+
+    def _end_discovery_epoch(self):
+        if self._discovery_epoch is not None:
+            self._discovery_epoch.close()
+            self._discovery_epoch = None
+
+    async def _discovery_maintenance_loop(self) -> None:
+        while self.is_connected:
+            try:
+                await asyncio.to_thread(discovery.maintain, self._discovery_home)
+            except (OSError, sqlite3.Error) as exc:
+                logger.warning("[%s] Discovery maintenance unavailable (%s)", self._log_tag, type(exc).__name__)
+            await asyncio.sleep(_DISCOVERY_MAINTENANCE_INTERVAL)
+
+    async def _receive_frames(self, epoch) -> None:
+        seen_dispatch = False
         while self._running and self._ws and not self._ws.closed:
             msg = await self._ws.receive()
             if msg.type == aiohttp.WSMsgType.TEXT:
                 payload = self._parse_json(msg.data)
-                if payload:
-                    self._dispatch_payload(payload)
+                if not payload:
+                    epoch.gap()
+                else:
+                    seq = payload.get("s")
+                    if payload.get("op") == 0:
+                        if (type(seq) is not int
+                                or (self._last_seq is not None and seq != self._last_seq + 1)
+                                or (seen_dispatch and payload.get("t") in {"READY", "RESUMED"})):
+                            epoch.gap()
+                        seen_dispatch = True
+                    if payload.get("op") == 0 and payload.get("t") in _DISCOVERY_EVENTS:
+                        # Await in wire order; a dashboard writer must not block other bots' heartbeats.
+                        await asyncio.to_thread(self._persist_discovery, payload["t"], payload.get("d"), epoch)
+                        self._dispatch_after_discovery(payload)
+                    else:
+                        self._dispatch_payload(payload)
             elif msg.type == aiohttp.WSMsgType.CLOSE:
                 raise QQCloseError(msg.data, msg.extra)
             elif msg.type in {aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR}:
@@ -542,11 +595,36 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
 
     def _close_ws_soon(self) -> None:
         """Close the WS so _read_events raises and _listen_loop reconnects (with Resume)."""
+        self._end_discovery_epoch()
         if self._ws and not self._ws.closed:
             self._create_task(self._ws.close())
 
     def _dispatch_payload(self, payload: dict[str, Any]) -> None:
         """Route inbound WebSocket payloads (dispatch synchronously, spawn async handlers)."""
+        if payload.get("op") == 0 and payload.get("t") in _DISCOVERY_EVENTS:
+            self._persist_discovery(payload["t"], payload.get("d"), self._discovery_epoch)
+        self._dispatch_after_discovery(payload)
+
+    def _persist_discovery(self, kind: str, data: Any, epoch) -> None:
+        if kind in _MEMBERSHIP_EVENTS:
+            if epoch is not None:
+                try:
+                    epoch.observe(kind, data)
+                except (OSError, sqlite3.Error) as exc:
+                    # Membership evidence was revoked under the confirm lock. Do
+                    # not reconnect/replay endlessly for a discovery-only fault.
+                    logger.warning("[%s] Discovery unavailable (%s)", self._log_tag, type(exc).__name__)
+        elif isinstance(data, dict):  # READY: trust the connection's resolved app ID, not user.id.
+            session, user = data.get("session_id"), data.get("user")
+            user_id = user.get("id") if isinstance(user, dict) else None
+            if isinstance(session, str) and session.strip() and isinstance(user_id, str) and user_id.strip():
+                # Registration is informational, not part of gateway authentication.
+                try:
+                    discovery.register(self._discovery_home, self._app_id)
+                except (OSError, sqlite3.Error) as exc:
+                    logger.warning("[%s] Discovery registration unavailable (%s)", self._log_tag, type(exc).__name__)
+
+    def _dispatch_after_discovery(self, payload: dict[str, Any]) -> None:
         op, t, s, d = payload.get("op"), payload.get("t"), payload.get("s"), payload.get("d")
         if isinstance(s, int) and (self._last_seq is None or s > self._last_seq):
             self._last_seq = s
@@ -570,6 +648,8 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                     logger.info("[%s] Ready, session_id=%s", self._log_tag, self._session_id)
             elif t == "RESUMED":
                 logger.info("[%s] Session resumed", self._log_tag)
+            elif t in _MEMBERSHIP_EVENTS:
+                return  # Administrative data only; never a chat event.
             elif t in self._INBOUND_HANDLERS:
                 asyncio.create_task(self._on_message(t, d))
             elif t == "INTERACTION_CREATE":
